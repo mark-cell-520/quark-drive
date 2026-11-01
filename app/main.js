@@ -18,6 +18,7 @@ const { app, BrowserWindow, Tray, Menu, ipcMain, shell } = require('electron');
 
 const core = require('../core/index.js');
 const { createWebDavServer } = require('../core/webdav/server.js');
+const { createOpQueue } = require('./op-queue.js');
 
 const isPackaged = app.isPackaged;
 const RESOURCES_VENDOR = path.join(process.resourcesPath || '', 'vendor');
@@ -37,16 +38,9 @@ let loginAbort = null;
 /** the in-flight login loop (cancel/refresh wait for it to settle) */
 let loginLoop = null;
 /** serialises server/mount/unmount operations (no concurrent rclone spawns) */
-let opChain = Promise.resolve();
+const { serialize } = createOpQueue();
 /** interval id for the in-flight transfer poller */
 let transferPoll = null;
-
-/** Run `fn` after all previously queued operations settled (pass or fail). */
-function serialize(fn) {
-  const next = opChain.then(fn, fn);
-  opChain = next.catch(() => {});
-  return next;
-}
 
 // ------------------------------------------------------------------ bootstrap
 
@@ -206,6 +200,8 @@ async function startServer() {
   return serialize(async () => {
     // A server object that is not listening (a failed earlier attempt) must
     // not be reused — server.address() would be null and crash the mount.
+    // (Nested serialize calls run inline — see op-queue.js — so calling this
+    // from inside mountDrive's own serialized block is safe.)
     if (server && server.listening) {
       return { port: server.address().port, urlPrefix: server.urlPrefix };
     }

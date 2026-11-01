@@ -109,7 +109,8 @@ test('main.js hardens the BrowserWindow (no nodeIntegration, isolation on, sandb
 
 test('N-2: mount/unmount/server operations are serialized in main.js', () => {
   // concurrent tray clicks must not spawn two rclone processes
-  assert.match(mainSrc, /function serialize\(/);
+  assert.match(mainSrc, /require\('\.\/op-queue\.js'\)/, 'main must use the op queue');
+  assert.match(mainSrc, /createOpQueue\(\)/);
   assert.match(mainSrc, /mountDrive[\s\S]*?return serialize\(/);
   assert.match(mainSrc, /unmountDrive[\s\S]*?return serialize\(/);
   assert.match(mainSrc, /startServer[\s\S]*?return serialize\(/);
