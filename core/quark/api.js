@@ -144,15 +144,23 @@ class QuarkApi {
 
   /** List every entry of a directory (follows pagination). */
   async listDirAll(pdirFid, opts = {}) {
-    const size = opts.size || 100;
+    const size = opts.size || 500;
     const first = await this.listDir(pdirFid, { page: 1, size });
     const entries = first.entries.slice();
     let page = 2;
-    while (entries.length < first.total && page <= 200) {
+    // A hard page cap protects against a server that keeps returning data;
+    // truncation is logged loudly rather than silent (a missing tail would
+    // otherwise look like "file not found" for real files).
+    const maxPages = opts.maxPages || 1000;
+    while (entries.length < first.total && page <= maxPages) {
       const next = await this.listDir(pdirFid, { page, size });
       if (!next.entries.length) break;
       entries.push(...next.entries);
       page++;
+    }
+    if (entries.length < first.total) {
+      this.logger.warn('listDirAll(' + pdirFid + '): got ' + entries.length + ' of ' +
+        first.total + ' entries (page cap ' + maxPages + ' reached)');
     }
     return entries;
   }
@@ -208,7 +216,12 @@ class QuarkApi {
       });
       this._check(out, 'task');
       const d = out.data;
-      if (!d || typeof d !== 'object') continue;
+      if (!d || typeof d !== 'object') {
+        // Unknown/expired task: keep polling until the deadline (checked
+        // FIRST — an unbounded continue here would loop forever).
+        if (Date.now() > deadline) throw new Error('download task timeout');
+        continue;
+      }
       const status = asInt(d.status);
       if (status === 3) throw new Error('download task failed (status=3)');
       if (status === 2) {

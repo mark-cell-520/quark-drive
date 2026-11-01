@@ -16,6 +16,7 @@
  * URL is the credential; sending cookies to the CDN host would leak them.
  */
 const crypto = require('node:crypto');
+const { AuthError } = require('./http.js');
 
 const DRIVE = 'https://drive-pc.quark.cn';
 const OSS_USER_AGENT = 'aliyun-sdk-js/1.0.0 Chrome 145.0.0.0 on Windows 10 64-bit';
@@ -27,6 +28,18 @@ const MAX_PART_SIZE = 64 * 1024 * 1024;   // 64 MiB
 function clampPartSize(n) {
   if (!Number.isFinite(n) || n <= 0) return DEFAULT_PART_SIZE;
   return Math.min(Math.max(Math.trunc(n), MIN_PART_SIZE), MAX_PART_SIZE);
+}
+
+/**
+ * How many part PUTs may be in flight at once. The server's part_thread is
+ * honoured (the official client uploads parts in parallel), capped at 4 and
+ * further bounded so in-flight part buffers stay under ~64 MiB regardless of
+ * the (server-chosen, up to 64 MiB) part size.
+ */
+function uploadConcurrency(pre, maxInFlightBytes = 64 * 1024 * 1024) {
+  const byMemory = Math.max(1, Math.floor(maxInFlightBytes / pre.partSize));
+  const wanted = pre.partThread || 3;
+  return Math.max(1, Math.min(wanted, 4, byMemory));
 }
 
 function rfc1123(date) {
@@ -93,6 +106,10 @@ class Uploader {
     }
     const data = out.data || {};
     const partSize = clampPartSize((data.metadata && Number(data.metadata.part_size)) || DEFAULT_PART_SIZE);
+    // The server advertises how many parts may be uploaded in parallel
+    // (the official client uploads parts concurrently — hence
+    // parallel_upload above). We honour it within a memory bound.
+    const partThread = Number(data.metadata && data.metadata.part_thread);
     return {
       taskId: String(data.task_id || ''),
       bucket: String(data.bucket || ''),
@@ -102,6 +119,7 @@ class Uploader {
       authInfo: data.auth_info,
       callback: data.callback,
       partSize,
+      partThread: Number.isFinite(partThread) && partThread > 0 ? Math.trunc(partThread) : null,
     };
   }
 
@@ -122,8 +140,9 @@ class Uploader {
       '?partNumber=' + partNumber + '&uploadId=' + encodeURIComponent(pre.uploadId);
   }
 
-  /** PUT one part. Returns the ETag. */
-  async _putPart(pre, partNumber, chunk, mimeType, sha1) {
+  /** PUT one part. `hashCtxB64` is the precomputed X-Oss-Hash-Ctx (state
+   *  covering parts 1..N-1) or null for part 1. Returns the ETag. */
+  async _putPart(pre, partNumber, chunk, mimeType, hashCtxB64) {
     const date = rfc1123(new Date());
     let authMeta = 'PUT\n\n' + mimeType + '\n' + date + '\n';
     const headers = {
@@ -131,10 +150,9 @@ class Uploader {
       'x-oss-date': date,
       'x-oss-user-agent': OSS_USER_AGENT,
     };
-    if (partNumber >= 2 && sha1) {
-      const ctxB64 = sha1.exportStateB64();
-      authMeta += 'X-Oss-Hash-Ctx:' + ctxB64 + '\n';
-      headers['X-Oss-Hash-Ctx'] = ctxB64;
+    if (partNumber >= 2 && hashCtxB64) {
+      authMeta += 'X-Oss-Hash-Ctx:' + hashCtxB64 + '\n';
+      headers['X-Oss-Hash-Ctx'] = hashCtxB64;
     }
     authMeta += 'x-oss-date:' + date + '\n' +
       'x-oss-user-agent:' + OSS_USER_AGENT + '\n' +
@@ -164,10 +182,20 @@ class Uploader {
 
   /** Step 3: submit full-file hashes; server answers 秒传 via data.finish. */
   async updateHash(md5hex, sha1hex, pre) {
-    const out = await this.http.requestJson('POST', DRIVE + '/1/clouddrive/file/update/hash', {
-      query: this._params(),
-      body: JSON.stringify({ md5: md5hex, sha1: sha1hex, task_id: pre.taskId }),
-    });
+    let out;
+    try {
+      out = await this.http.requestJson('POST', DRIVE + '/1/clouddrive/file/update/hash', {
+        query: this._params(),
+        body: JSON.stringify({ md5: md5hex, sha1: sha1hex, task_id: pre.taskId }),
+      });
+    } catch (e) {
+      // A dead session must surface (re-login); a transport blip must not:
+      // all parts are already uploaded, so degrade to a normal commit
+      // instead of failing the whole upload.
+      if (e instanceof AuthError) throw e;
+      this.logger.warn('update/hash failed (' + e.message + ') — degrading to a normal commit');
+      return { finish: false };
+    }
     const code = out && out.code;
     if (!out || (code !== 0 && code !== 200)) {
       // Non-fatal: degrade to a normal commit.
@@ -183,11 +211,17 @@ class Uploader {
       etags.map((e, i) => '<Part><PartNumber>' + (i + 1) + '</PartNumber><ETag>' + e + '</ETag></Part>').join('') +
       '</CompleteMultipartUpload>';
     const md5b64 = b64(crypto.createHash('md5').update(xml).digest());
+    // Callback normalization: a string is treated as the callback JSON text,
+    // an object is serialized; anything else (number/boolean/null) is not a
+    // valid callback payload and is dropped rather than base64'd blindly
+    // (base64("0") would be signed and sent as a bogus x-oss-callback).
     let callbackB64 = '';
     try {
-      if (typeof pre.callback === 'string') callbackB64 = b64(Buffer.from(pre.callback, 'utf8'));
-      else if (pre.callback && typeof pre.callback === 'object') callbackB64 = b64(Buffer.from(JSON.stringify(pre.callback), 'utf8'));
-      else callbackB64 = b64(Buffer.from(String(pre.callback || ''), 'utf8'));
+      if (typeof pre.callback === 'string' && pre.callback !== '') {
+        callbackB64 = b64(Buffer.from(pre.callback, 'utf8'));
+      } else if (pre.callback && typeof pre.callback === 'object') {
+        callbackB64 = b64(Buffer.from(JSON.stringify(pre.callback), 'utf8'));
+      }
     } catch (_e) { callbackB64 = ''; }
 
     const date = rfc1123(new Date());
@@ -235,6 +269,12 @@ class Uploader {
   /**
    * Upload a stream (async iterable of Buffers) or a Buffer.
    *
+   * Parts are uploaded concurrently (the official client does the same —
+   * the pre response even carries part_thread). The SHA-1 chain is advanced
+   * while parts are PRODUCED, so each part's X-Oss-Hash-Ctx (state covering
+   * parts 1..N-1) is precomputed before its PUT — the protocol semantics are
+   * identical to the sequential flow, only the network waits overlap.
+   *
    * @param {{
    *   parentFid: string,
    *   fileName: string,
@@ -253,30 +293,54 @@ class Uploader {
       throw new UploadError('pre', 'incomplete pre response');
     }
 
+    const self = this;
     const md5 = crypto.createHash('md5');
     const sha1 = new this._Sha1Ctx();
+    /** 0-based index -> etag (filled as parts complete, order preserved) */
     const etags = [];
     let loaded = 0;
+    let partCount = 0;
 
-    const parts = this._iterParts(opts, pre.partSize);
-
-    let partNumber = 0;
-    for await (const partBuf of parts) {
-      partNumber++;
-      // NOTE: the hash state must lag one part behind the PUT — OSS expects
-      // X-Oss-Hash-Ctx of part N to cover parts 1..N-1. So we feed the hash
-      // only after the current part has been accepted.
-      const etag = await this._putPart(pre, partNumber, partBuf, mimeType, sha1);
-      md5.update(partBuf);
-      sha1.update(partBuf);
-      etags.push(etag);
-      loaded += partBuf.length;
-      if (opts.onProgress) {
-        try { opts.onProgress(loaded, opts.size); } catch (_e) { /* ignore */ }
+    // Produce parts while advancing the hash chain. The generator runs ahead
+    // of the network: its awaits are stream reads + CPU hashing.
+    async function* produce() {
+      for await (const buf of self._iterParts(opts, pre.partSize)) {
+        partCount++;
+        // snapshot the state BEFORE this part (covers parts 1..N-1)
+        const hashCtxB64 = partCount >= 2 ? sha1.exportStateB64() : null;
+        md5.update(buf);
+        sha1.update(buf);
+        yield { partNumber: partCount, buf, hashCtxB64 };
       }
-      this.logger.debug('upload part ' + partNumber + ' done (' + partBuf.length + ' bytes)');
     }
-    if (partNumber === 0) {
+
+    const iterator = produce()[Symbol.asyncIterator]();
+    const errors = [];
+    const uploadOne = async () => {
+      try {
+        for (;;) {
+          const { done, value } = await iterator.next();
+          if (done) return;
+          const { partNumber, buf, hashCtxB64 } = value;
+          const etag = await self._putPart(pre, partNumber, buf, mimeType, hashCtxB64);
+          etags[partNumber - 1] = etag;
+          loaded += buf.length;
+          if (opts.onProgress) {
+            try { opts.onProgress(loaded, opts.size); } catch (_e) { /* ignore */ }
+          }
+          self.logger.debug('upload part ' + partNumber + ' done (' + buf.length + ' bytes)');
+        }
+      } catch (e) {
+        errors.push(e);
+      }
+    };
+
+    const workers = [];
+    for (let w = 0; w < uploadConcurrency(pre); w++) workers.push(uploadOne());
+    await Promise.all(workers);
+    if (errors.length) throw errors[0];
+
+    if (partCount === 0) {
       // Empty file: OSS still needs one (empty) part + commit.
       const etag = await this._putPart(pre, 1, Buffer.alloc(0), mimeType, null);
       etags.push(etag);
@@ -303,18 +367,30 @@ class Uploader {
       return;
     }
     if (!opts.stream) throw new UploadError('input', 'no stream or buffer provided');
-    let acc = Buffer.alloc(0);
-    for await (const chunk of opts.stream) {
-      if (!chunk || chunk.length === 0) continue;
-      acc = acc.length ? Buffer.concat([acc, chunk]) : Buffer.from(chunk);
-      while (acc.length >= partSize) {
-        const part = acc.subarray(0, partSize);
-        acc = acc.subarray(partSize);
-        yield part;
+    // Preallocated fill-and-flush accumulator: re-concatenating the pending
+    // buffer on every chunk is quadratic (a 64 MiB part ingests at ~3 MB/s
+    // that way); copying into a fixed buffer is linear. Each flushed part is
+    // a fresh allocation because the consumer holds it across the PUT await.
+    let acc = Buffer.allocUnsafe(partSize);
+    let accLen = 0;
+    for await (const raw of opts.stream) {
+      if (!raw || raw.length === 0) continue;
+      const chunk = Buffer.isBuffer(raw) ? raw : Buffer.from(raw);
+      let off = 0;
+      while (off < chunk.length) {
+        const take = Math.min(partSize - accLen, chunk.length - off);
+        chunk.copy(acc, accLen, off, off + take);
+        accLen += take;
+        off += take;
+        if (accLen === partSize) {
+          yield acc;
+          acc = Buffer.allocUnsafe(partSize);
+          accLen = 0;
+        }
       }
     }
-    if (acc.length > 0) yield acc;
+    if (accLen > 0) yield acc.subarray(0, accLen);
   }
 }
 
-module.exports = { Uploader, UploadError, DEFAULT_PART_SIZE };
+module.exports = { Uploader, UploadError, DEFAULT_PART_SIZE, uploadConcurrency };

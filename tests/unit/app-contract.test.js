@@ -19,6 +19,7 @@ const mainSrc = fs.readFileSync(path.join(APP, 'main.js'), 'utf8');
 const preloadSrc = fs.readFileSync(path.join(APP, 'preload.js'), 'utf8');
 const rendererSrc = fs.readFileSync(path.join(APP, 'renderer', 'app.js'), 'utf8');
 const htmlSrc = fs.readFileSync(path.join(APP, 'renderer', 'index.html'), 'utf8');
+const rcloneSrc = fs.readFileSync(path.join(__dirname, '..', '..', 'core', 'mount', 'rclone.js'), 'utf8');
 
 function handlers(src) {
   return new Set([...src.matchAll(/ipcMain\.handle\(\s*'([^']+)'/g)].map((m) => m[1]));
@@ -104,4 +105,54 @@ test('main.js hardens the BrowserWindow (no nodeIntegration, isolation on, sandb
   assert.match(mainSrc, /requestSingleInstanceLock/);
   // renderer HTML must not inline remote scripts
   assert.doesNotMatch(htmlSrc, /<script[^>]+src="https?:/);
+});
+
+test('N-2: mount/unmount/server operations are serialized in main.js', () => {
+  // concurrent tray clicks must not spawn two rclone processes
+  assert.match(mainSrc, /function serialize\(/);
+  assert.match(mainSrc, /mountDrive[\s\S]*?return serialize\(/);
+  assert.match(mainSrc, /unmountDrive[\s\S]*?return serialize\(/);
+  assert.match(mainSrc, /startServer[\s\S]*?return serialize\(/);
+  // a failed listen must not leave a dead server object behind
+  assert.match(mainSrc, /server && server\.listening/);
+});
+
+test('N-4: logout drops the in-memory session and stops the WebDAV server', () => {
+  const logout = /auth:logout'[\s\S]*?\}\);/.exec(mainSrc);
+  assert.ok(logout, 'logout handler not found');
+  assert.match(logout[0], /new CookieJar\(\)/, 'logout must reset the cookie jar');
+  assert.match(logout[0], /closeAsync\(\)/, 'logout must stop the WebDAV server');
+  assert.match(logout[0], /cancelLogin\(\)/, 'logout must stop an in-flight login');
+});
+
+test('N-3: the login loop carries an abort signal into every HTTP call', () => {
+  assert.match(mainSrc, /auth\.start\(\{ signal: ac\.signal \}\)/);
+  assert.match(mainSrc, /auth\.poll\(\{ signal: ac\.signal \}\)/);
+  assert.match(mainSrc, /auth\.complete\([^)]*\{ signal: ac\.signal \}\)/);
+  assert.match(mainSrc, /async function cancelLogin\(/);
+});
+
+test('N-1: the rclone RC daemon requires per-run credentials', () => {
+  assert.doesNotMatch(rcloneSrc, /--rc-no-auth/, 'the RC API must never be unauthenticated');
+  assert.match(rcloneSrc, /--rc-user/);
+  assert.match(rcloneSrc, /--rc-pass/);
+  assert.match(rcloneSrc, /Authorization.*Basic|Basic.*Authorization/, 'RC calls must authenticate');
+  assert.match(rcloneSrc, /randomCreds/, 'credentials must be generated per run');
+});
+
+test('feature: transfer progress polling and start-minimized are wired', () => {
+  assert.match(mainSrc, /startTransferPoll\(\)/, 'mounting must start the transfer poll');
+  assert.match(mainSrc, /stopTransferPoll\(\)/, 'unmounting must stop the transfer poll');
+  assert.match(mainSrc, /listTransfers/, 'the poll must read rclone transfers');
+  assert.match(mainSrc, /startMinimized/, 'the start-minimized setting must be honoured');
+  assert.match(mainSrc, /createWindow\(\{ show: !stack\.settings\.startMinimized \}\)/);
+  // the new settings key is whitelisted and the new channels exist
+  const wl = /SETTINGS_WHITELIST = new Set\(\[([^\]]*)\]\)/.exec(mainSrc);
+  assert.ok(wl[1].includes("'startMinimized'"), 'startMinimized must be renderer-settable');
+  const events = listLiteral(preloadSrc, 'EVENT_CHANNELS');
+  assert.ok(events.has('drive:transfers'), 'drive:transfers must be whitelisted');
+  const invoke = listLiteral(preloadSrc, 'INVOKE_CHANNELS');
+  for (const c of ['app:openDrive', 'app:quit']) {
+    assert.ok(invoke.has(c), c + ' must be whitelisted');
+  }
 });

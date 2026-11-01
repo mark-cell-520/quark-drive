@@ -24,9 +24,11 @@ Explorer → WinFsp → rclone VFS → GET /<token>/docs/a.txt
 ```
 
 要点：
-- 目录列表有 TTL 缓存（LRU 512）+ 并发同目录 list 去重
-- Range 请求透传给 CDN，长度以**上游实际返回**为准
-- 客户端断连时 abort 上游 fetch（无 socket 泄漏）
+- 目录列表有 TTL 缓存（LRU 512）+ 并发同目录 list 去重 + 名称索引 + stat 对象缓存
+- 预签名 CDN URL 按 fid 缓存 5 分钟（403 淘汰重取），重复打开不再打 API
+- Range 请求透传给 CDN，长度以**上游实际返回**为准（缺 Content-Length 时用 stat 尺寸，
+  `Number(null)===0` 陷阱已修）
+- 客户端断连时 abort 上游 fetch（无 socket 泄漏）+ body 级空闲看门狗
 
 ### 写（拖文件进 Q:\）
 
@@ -43,22 +45,33 @@ Explorer → rclone VFS 缓存 → PUT /<token>/docs/big.bin
 
 覆盖语义是**先传后删**：上传失败旧文件完好，绝不出现"删了没传上"的丢失窗口。
 
+分片按 `pre` 响应的 `part_thread` 并发上传（封顶 4、在途内存 ~64 MiB 约束）：
+SHA-1 链在生产分片时顺序推进，每片的 `X-Oss-Hash-Ctx`（覆盖 1..N-1）在 PUT 前
+预计算——协议语义与串行版完全一致，只是网络等待重叠。
+
 ### 挂载生命周期（rclone RC 原生）
 
 ```
-MountManager.mount()
-  1. freePort() 选 RC 端口 → spawn `rclone rcd --rc-addr 127.0.0.1:P --rc-no-auth`
-  2. 轮询 POST /core/version 直到 RC 就绪
-  3. POST /mount/mount {fs: ":webdav,url='http://127.0.0.1:PORT/<token>',vendor='other':",
-                        mountPoint: "Q:", vfsOpt: {VfsCacheMode: writes, DirCacheTime: 10s}}
+MountManager.mount()   （在途锁：并发调用合并为一次尝试，绝不出孤儿进程）
+  1. freePort() 选 RC 端口 → 生成本次运行随机 RC 凭证
+     spawn `rclone rcd --rc-addr 127.0.0.1:P --rc-user U --rc-pass P --transfers 8`
+  2. 轮询 POST /core/version（Basic auth）直到 RC 就绪
+  3. POST /mount/mount {fs: ":webdav,url='http://127.0.0.1:PORT/<token>',vendor='other',timeout='30m':",
+                        mountPoint: "Q:", vfsOpt: {VfsCacheMode: writes, DirCacheTime: 5m,
+                        BufferSize: 64M, VfsCacheMaxSize: 10G, VfsReadChunkSize: 16M,
+                        VfsReadChunkStreams: 8, VfsWriteBack: 5s}}
   4. 轮询 POST /mount/listmounts 直到 MountPoint == Q:
   5. unmount: POST /mount/unmount {mountPoint: "Q:"}（优雅，刷新 VFS 待传队列）
+  6. 挂载期间主进程每 2s 轮询 POST /core/transfers → 渲染层传输进度行
 ```
 
 为什么用 RC 而不是 `rclone mount` 子进程 + 探活：
 - 探活若用 `fs.existsSync` 轮询，挂载卡死会把整个应用卡死（Node 单线程）
 - CLI 挂载不会登记到 `mount/listmounts`，无法精确感知就绪
 - RC 卸载会先 flush VFS 缓存，避免"退出时丢上传"
+
+RC 端点是**每运行随机凭证保护**的：无凭证请求（含浏览器 CORS simple request）
+一律 401——否则同机任意进程可借受害者身份枚举文件系统或卸载盘符。
 
 ### 登录（扫码）
 

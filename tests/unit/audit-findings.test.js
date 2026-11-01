@@ -147,6 +147,32 @@ test('F-4: MOVE rejects a destination name with control characters', async () =>
   await assert.rejects(fs.move('/a.txt', '/..'), (e) => e.httpStatus === 409);
 });
 
+test('N-7: PUT/MKCOL reject Windows-illegal and reserved names', async () => {
+  const { fs, api: api0 } = makeFs();
+  const bad = [
+    'CON', 'con.txt', 'PRN', 'aux.js', 'NUL', 'COM1', 'lpt9.dat',   // reserved devices
+    'trailing.', 'trailing ', ' lead',                              // mangled by Win32
+    'a?b', 'a*b', 'a:b', 'a"b', 'a<b', 'a>b', 'a|b',                // illegal chars
+  ];
+  for (const name of bad) {
+    await assert.rejects(
+      fs.writeFile('/' + name, null, 1, { buffer: Buffer.from('x') }),
+      (e) => e.httpStatus === 409,
+      'PUT name ' + JSON.stringify(name) + ' must be rejected',
+    );
+    await assert.rejects(
+      fs.mkdir('/' + name),
+      (e) => e.httpStatus === 409,
+      'MKCOL name ' + JSON.stringify(name) + ' must be rejected',
+    );
+  }
+  // ordinary names (including dots inside, unicode, spaces inside) still pass
+  const before = api0.calls.mkdir.length;
+  await fs.mkdir('/normal dir.txt');
+  assert.equal(api0.calls.mkdir.length, before + 1, 'a legal name must reach the API');
+  assert.deepEqual(api0.calls.mkdir[before], ['0', 'normal dir.txt']);
+});
+
 test('F-4: PROPFIND XML stays well-formed for hostile existing names', async () => {
   // a name with an XML-invalid control char already in the drive must not
   // produce malformed XML (escapeXml strips invalid chars)

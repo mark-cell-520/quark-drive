@@ -198,3 +198,55 @@ test('move onto an existing file target is 409', async () => {
   const { fs } = makeFs();
   await assert.rejects(fs.move('/docs/b.txt', '/a.txt'), (e) => e.httpStatus === 409);
 });
+
+test('H12: download URLs are cached briefly and refreshed after a 403', async () => {
+  const tree = JSON.parse(JSON.stringify(TREE));
+  const api = fakeApi(tree);
+  let urlCalls = 0;
+  api.getDownloadUrl = async (fid) => { urlCalls++; return { url: 'http://x/' + fid, size: 5 }; };
+  let httpCalls = 0;
+  const httpDouble = {
+    async request(method, url) {
+      httpCalls++;
+      if (httpCalls === 1) {
+        // stale pre-signed URL -> the CDN answers 403
+        return { status: 403, headers: { get: () => null }, body: Buffer.alloc(0) };
+      }
+      return {
+        status: 200,
+        headers: { get: (k) => ({ 'content-type': 'text/plain', 'content-length': '5' }[k] || null) },
+        response: { body: Readable.toWeb(Readable.from([Buffer.from('hello')])) },
+        body: null,
+      };
+    },
+  };
+  const fs = new QuarkFs({ api, uploader: fakeUploader(), http: httpDouble, cacheTtlMs: 60000, now: () => 1000 });
+  const opened = await fs.createReadStream('/a.txt');
+  assert.ok(opened);
+  assert.equal(opened.status, 200);
+  opened.stream.resume();
+  assert.equal(urlCalls, 2, 'a 403 must evict the cache and fetch a fresh URL');
+  // the fresh URL is reused by the next open
+  const opened2 = await fs.createReadStream('/a.txt');
+  opened2.stream.resume();
+  assert.equal(urlCalls, 2, 'the fresh URL must be cached');
+});
+
+test('A-2: a missing Content-Length must not truncate the file to 0 bytes', async () => {
+  const tree = JSON.parse(JSON.stringify(TREE));
+  const api = fakeApi(tree);
+  const httpDouble = {
+    async request() {
+      return {
+        status: 200,
+        headers: { get: () => null }, // no content-length, no content-type
+        response: { body: Readable.toWeb(Readable.from([Buffer.from('hello world')])) },
+        body: null,
+      };
+    },
+  };
+  const fs = new QuarkFs({ api, uploader: fakeUploader(), http: httpDouble, cacheTtlMs: 60000, now: () => 1000 });
+  const opened = await fs.createReadStream('/a.txt');
+  assert.equal(opened.size, 11, 'the stat size must survive a length-less upstream');
+  opened.stream.resume();
+});

@@ -5,17 +5,28 @@
  * The Quark namespace is exposed as a local drive by combining:
  *   our WebDAV server (127.0.0.1)  <-rclone mount->  WinFsp  ->  drive letter
  *
- * This module owns the rclone child process: locating the binary, building the
- * remote spec, spawning, readiness detection and teardown.
+ * This module owns the rclone child process: locating the binary, building
+ * the remote spec, spawning, readiness detection and teardown.
  *
  * Readiness is detected through rclone's own RC API (`--rc`): we poll
  * /mount/listmounts until our mount point appears. That avoids probing the
  * mounted filesystem (which can hang forever on a broken mount) and avoids
  * spawning helper processes — the Electron app's process.execPath is
  * electron.exe, which cannot run node scripts.
+ *
+ * Hardening:
+ *  - the RC endpoint is protected by per-run random credentials (Basic auth);
+ *    without them any local process — or a browser page via a CORS simple
+ *    request — could enumerate the filesystem or (un)mount drives.
+ *  - mount/unmount are serialized by in-flight locks, and a failing attempt
+ *    only clears state it owns (generation token), so a concurrent or failed
+ *    mount can never orphan an rclone process holding the drive letter.
  */
 const net = require('node:net');
-const { spawn: defaultSpawn, execFileSync } = require('node:child_process');
+const crypto = require('node:crypto');
+const { spawn: defaultSpawn, execFile } = require('node:child_process');
+const { promisify } = require('node:util');
+const execFileAsync = promisify(execFile);
 const fs = require('node:fs');
 const path = require('node:path');
 
@@ -38,6 +49,14 @@ function normalizeLetter(letter) {
   return m[1].toUpperCase();
 }
 
+/** Random per-run RC credentials (never persisted, never logged). */
+function randomCreds() {
+  return {
+    user: 'qd' + crypto.randomBytes(6).toString('hex'),
+    pass: crypto.randomBytes(18).toString('base64url'),
+  };
+}
+
 class MountManager {
   /**
    * @param {{
@@ -46,9 +65,11 @@ class MountManager {
    *   rclonePath?: string,          // explicit override
    *   vendorDir?: string,           // bundled rclone location
    *   spawn?: typeof defaultSpawn,  // injectable for tests
+   *   execFile?: typeof execFile,   // injectable for tests
    *   freePort?: () => Promise<number>, // injectable for tests
    *   sleep?: (ms: number) => Promise<void>,
    *   now?: () => number,
+   *   onStateChange?: () => void,   // notified when rclone exits unexpectedly
    * }} opts
    */
   constructor(opts = {}) {
@@ -57,17 +78,24 @@ class MountManager {
     this.rclonePath = opts.rclonePath || this.settings.rclonePath || '';
     this.vendorDir = opts.vendorDir || path.join(__dirname, '..', '..', 'vendor');
     this.spawn = opts.spawn || defaultSpawn;
+    this.execFile = opts.execFile || execFileAsync;
     this.freePort = opts.freePort || freePort;
     this.sleep = opts.sleep || ((ms) => new Promise((r) => setTimeout(r, ms)));
     this.now = opts.now || (() => Date.now());
+    this.onStateChange = opts.onStateChange || null;
     /** @type {import('node:child_process').ChildProcess|null} */
     this.child = null;
     /** @type {{letter: string, port: number, startedAt: number, logFile: string}|null} */
     this.mountInfo = null;
+    /** in-flight locks: a second concurrent call joins the first */
+    this.mountPromise = null;
+    this.unmountPromise = null;
+    /** generation token: a failing attempt must only clear ITS OWN state */
+    this.generation = 0;
   }
 
   /** Locate the rclone binary: explicit path → vendor/ → PATH. */
-  findRclone() {
+  async findRclone() {
     const candidates = [];
     if (this.rclonePath) candidates.push(this.rclonePath);
     candidates.push(path.join(this.vendorDir, 'rclone.exe'));
@@ -76,7 +104,7 @@ class MountManager {
       try {
         if (c === DEFAULT_RCLONE || fs.existsSync(c)) {
           // verify it runs
-          execFileSync(c, ['version'], { timeout: 10000, stdio: 'ignore' });
+          await this.execFile(c, ['version'], { timeout: 10000, stdio: 'ignore' });
           return c;
         }
       } catch (_e) { /* try next */ }
@@ -86,16 +114,16 @@ class MountManager {
 
   /**
    * Detect WinFsp (the kernel driver rclone needs on Windows).
-   * @returns {{ok: boolean, reason?: string}}
+   * @returns {Promise<{ok: boolean, reason?: string}>}
    */
-  checkWinFsp() {
+  async checkWinFsp() {
     // The launcher service is the reliable signal (the .sys is loaded on demand).
     try {
-      const out = execFileSync('sc.exe', ['query', 'winfsp.launcher'], {
+      const { stdout } = await this.execFile('sc.exe', ['query', 'winfsp.launcher'], {
         timeout: 8000, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'],
       });
-      if (/STATE\s+:\s*4/.test(out)) return { ok: true }; // RUNNING
-      if (/does not exist/i.test(out)) {
+      if (/STATE\s+:\s*4/.test(stdout)) return { ok: true }; // RUNNING
+      if (/does not exist/i.test(stdout)) {
         return { ok: false, reason: 'WinFsp is not installed (run the bundled winfsp installer)' };
       }
       return { ok: true }; // installed but stopped — rclone can start it
@@ -131,16 +159,26 @@ class MountManager {
    * detection (listmounts) and graceful unmount (VFS flush) without probing
    * the mounted filesystem — which can hang forever on a broken mount.
    *
+   * Concurrent calls join the in-flight mount (no orphan rclone processes).
+   *
    * @param {{port: number, urlPrefix?: string, letter?: string, logFile?: string}} opts
    * @returns {Promise<{letter: string, pid: number, rcPort: number}>}
    */
   async mount(opts) {
+    if (this.mountPromise) return this.mountPromise;
+    const p = this._mountLocked(opts).finally(() => { this.mountPromise = null; });
+    this.mountPromise = p;
+    return p;
+  }
+
+  async _mountLocked(opts) {
     if (this.isMounted) throw new MountError('mount', 'already mounted at ' + this.mountInfo.letter + ':');
+    const myGeneration = ++this.generation;
     const letter = normalizeLetter(opts.letter || this.settings.driveLetter || 'Q');
-    const winfsp = this.checkWinFsp();
+    const winfsp = await this.checkWinFsp();
     if (!winfsp.ok) throw new MountError('mount', winfsp.reason);
 
-    const rclone = this.findRclone();
+    const rclone = await this.findRclone();
     const root = letter + ':\\';
     if (fs.existsSync(root)) {
       throw new MountError('mount', 'drive ' + letter + ': is already in use');
@@ -148,15 +186,23 @@ class MountManager {
 
     // the WebDAV server's secret URL prefix (per-run auth token)
     const prefix = opts.urlPrefix || '/';
-    const remote = ":webdav,url='http://127.0.0.1:" + opts.port + prefix + "',vendor='other':";
+    // 30m matches the server-side download watchdog (rclone's webdav default
+    // of 5m would abort slow CDN reads that the server is still serving)
+    const remote = ":webdav,url='http://127.0.0.1:" + opts.port + prefix + "',vendor='other',timeout='30m':";
     const mo = this.settings.mountOptions || {};
     const rcPort = await this.freePort();
+    // per-run RC credentials: the RC API can enumerate the filesystem and
+    // (un)mount drives, so it must not be an open door on loopback
+    const creds = randomCreds();
 
     // `rclone rcd` = the remote-control daemon (no filesystem side effects).
     const args = [
       'rcd',
       '--rc-addr', '127.0.0.1:' + rcPort,
-      '--rc-no-auth',
+      '--rc-user', creds.user,
+      '--rc-pass', creds.pass,
+      // parallel part uploads / multi-file copies through the VFS
+      '--transfers', '8',
       '--log-level', 'INFO',
     ];
     if (mo.cacheDir) args.push('--cache-dir', mo.cacheDir);
@@ -167,11 +213,9 @@ class MountManager {
       windowsHide: true,
       stdio: ['ignore', 'ignore', 'pipe'],
     });
-    this.child = child;
-    this.mountInfo = {
-      letter, port: opts.port, rcPort, startedAt: this.now(),
-      logFile: opts.logFile || null,
-    };
+
+    /** RC credentials live with this attempt (closure), never on the instance. */
+    const rcAuth = { user: creds.user, pass: creds.pass, port: rcPort };
 
     let stderr = '';
     const onStderr = (d) => {
@@ -181,6 +225,15 @@ class MountManager {
     const onExit = (code) => {
       this.logger.warn('rclone exited (code=' + code + ')' + (stderr ? ': ' + stderr.slice(-500) : ''));
       if (this.mountInfo) this.mountInfo.exitedAt = this.now();
+      // Only clear state if it still belongs to THIS child: a newer mount may
+      // already have replaced it.
+      if (this.child === child) {
+        this.child = null;
+        this.mountInfo = null;
+        if (this.onStateChange) {
+          try { this.onStateChange(); } catch (_e) { /* listener errors are fatal-free */ }
+        }
+      }
     };
     child.on('exit', onExit);
 
@@ -194,10 +247,15 @@ class MountManager {
 
     const fail = (msg) => {
       const tail = stderr.trim();
-      this.mountInfo = null;
+      // Only clear the SHARED state when it was published by THIS attempt —
+      // a healthy earlier/concurrent mount must keep its child/mountInfo
+      // (otherwise a failed retry would orphan its rclone process).
+      if (this.mountInfo && this.mountInfo.generation === myGeneration) {
+        this.mountInfo = null;
+        this.child = null;
+      }
       try { child.kill(); } catch (_e) { /* ignore */ }
       releaseChild();
-      this.child = null;
       throw new MountError('mount', msg + (tail ? ' — ' + tail.slice(-300) : ''));
     };
 
@@ -208,7 +266,7 @@ class MountManager {
         if (child.exitCode !== null) {
           fail('rclone exited early: ' + (stderr.trim() || 'code ' + child.exitCode));
         }
-        if (await this._rcPost(rcPort, '/core/version', {}) !== null) break;
+        if (await this._rcPost(rcAuth, '/core/version', {}) !== null) break;
         if (this.now() > rcDeadline) fail('rclone RC did not come up');
         await this.sleep(250);
       }
@@ -216,14 +274,19 @@ class MountManager {
       // 2. start the mount through the RC API.
       // NOTE: no `mountType` — this rclone version rejects it as an
       // unregistered mount option.
-      const mountRes = await this._rcPost(rcPort, '/mount/mount', {
+      const mountRes = await this._rcPost(rcAuth, '/mount/mount', {
         fs: remote,
         mountPoint: root,
         mountOpt: {},
         // VFS options live in vfsOpt (mountOpt is the FUSE layer)
         vfsOpt: {
           VfsCacheMode: mo.vfsCacheMode || 'writes',
-          DirCacheTime: mo.dirCacheTime || '10s',
+          DirCacheTime: mo.dirCacheTime || '5m',
+          VfsCacheMaxSize: mo.vfsCacheMaxSize || '10G',
+          VfsWriteBack: mo.vfsWriteBack || '5s',
+          BufferSize: mo.bufferSize || '64M',
+          VfsReadChunkSize: mo.vfsReadChunkSize || '16M',
+          VfsReadChunkStreams: mo.vfsReadChunkStreams == null ? 8 : mo.vfsReadChunkStreams,
         },
       });
       if (mountRes === null) fail('mount/mount failed');
@@ -233,7 +296,13 @@ class MountManager {
       const deadline = this.now() + READY_TIMEOUT_MS;
       for (;;) {
         if (child.exitCode !== null) fail('rclone exited early: ' + (stderr.trim() || 'code ' + child.exitCode));
-        if (await this._rcMountReady(rcPort, root)) {
+        if (await this._rcMountReady(rcAuth, root)) {
+          // publish state only now that the mount is real
+          this.child = child;
+          this.mountInfo = {
+            letter, port: opts.port, rcPort, startedAt: this.now(),
+            logFile: opts.logFile || null, rcAuth, generation: myGeneration,
+          };
           this.logger.info('mounted ' + root + ' (pid ' + child.pid + ', rc ' + rcPort + ')');
           return { letter, pid: child.pid, rcPort };
         }
@@ -246,12 +315,19 @@ class MountManager {
     }
   }
 
-  /** POST to the rclone RC API; returns parsed JSON or null on any failure. */
-  async _rcPost(rcPort, path, body) {
+  /** POST to the rclone RC API with this attempt's Basic-auth credentials. */
+  async _rcPost(rcAuth, path, body) {
+    const port = rcAuth && rcAuth.port;
+    if (port == null) return null;
     try {
-      const res = await fetch('http://127.0.0.1:' + rcPort + path, {
+      const headers = { 'Content-Type': 'application/json' };
+      if (rcAuth.user != null) {
+        const token = Buffer.from(rcAuth.user + ':' + rcAuth.pass, 'utf8').toString('base64');
+        headers.Authorization = 'Basic ' + token;
+      }
+      const res = await fetch('http://127.0.0.1:' + port + path, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers,
         body: JSON.stringify(body || {}),
         signal: AbortSignal.timeout(10000),
       });
@@ -269,8 +345,8 @@ class MountManager {
   }
 
   /** Poll rclone's RC /mount/listmounts until our mount point shows up. */
-  async _rcMountReady(rcPort, root) {
-    const j = await this._rcPost(rcPort, '/mount/listmounts', {});
+  async _rcMountReady(rcAuth, root) {
+    const j = await this._rcPost(rcAuth, '/mount/listmounts', {});
     if (!j) return false;
     const want = root.replace(/[\\/]+$/, '').toUpperCase();
     const points = Array.isArray(j.mountPoints) ? j.mountPoints : [];
@@ -282,21 +358,45 @@ class MountManager {
   }
 
   /** Ask rclone to unmount gracefully (flushes the VFS cache); kill as fallback. */
-  async _rcUnmount(rcPort, mountPoint) {
-    const j = await this._rcPost(rcPort, '/mount/unmount', { mountPoint: mountPoint || '' });
+  async _rcUnmount(rcAuth, mountPoint) {
+    const j = await this._rcPost(rcAuth, '/mount/unmount', { mountPoint: mountPoint || '' });
     return j !== null;
+ }
+
+  /**
+   * In-flight transfers (VFS uploads/downloads) for the UI's progress line.
+   * @returns {Promise<Array<{name: string, size: number, bytes: number, percentage: number}>>}
+   */
+  async listTransfers() {
+    const info = this.mountInfo;
+    if (!info || !info.rcAuth || !this.isMounted) return [];
+    const j = await this._rcPost(info.rcAuth, '/core/transfers', {});
+    if (!j || !Array.isArray(j.transfers)) return [];
+    return j.transfers.map((t) => ({
+      name: String(t.name || '').split(/[\\/]/).pop() || 'file',
+      size: Number(t.size) || 0,
+      bytes: Number(t.bytes) || 0,
+      percentage: Math.max(0, Math.min(100, Number(t.percentage) || 0)),
+    }));
   }
 
   /** Unmount: ask rclone via RC (graceful, flushes the VFS), then kill. */
   async unmount() {
+    if (this.unmountPromise) return this.unmountPromise;
+    const p = this._unmountLocked().finally(() => { this.unmountPromise = null; });
+    this.unmountPromise = p;
+    return p;
+  }
+
+  async _unmountLocked() {
     const child = this.child;
     const info = this.mountInfo;
     this.mountInfo = null;
     this.child = null;
     if (!child || child.exitCode !== null) return { unmounted: false };
 
-    if (info && info.rcPort) {
-      const ok = await this._rcUnmount(info.rcPort, info.letter + ':');
+    if (info && info.rcAuth) {
+      const ok = await this._rcUnmount(info.rcAuth, info.letter + ':');
       if (ok) {
         // wait briefly for rclone to exit on its own
         const deadline = this.now() + 15000;
@@ -332,4 +432,4 @@ function freePort() {
   });
 }
 
-module.exports = { MountManager, MountError, normalizeLetter };
+module.exports = { MountManager, MountError, normalizeLetter, randomCreds };

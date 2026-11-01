@@ -14,6 +14,10 @@ const { isDirEntry, toDate } = require('../quark/api.js');
 const ROOT_FID = '0';
 /** Max cached directory listings (bounded memory for long-running mounts). */
 const DIR_CACHE_MAX = 512;
+/** Max cached pre-signed download URLs (fid -> {url, ts}). */
+const URL_CACHE_MAX = 256;
+/** Pre-signed CDN URLs live for many minutes; 5 min is a safe reuse window. */
+const URL_CACHE_TTL_MS = 5 * 60 * 1000;
 
 function normalizePath(p) {
   let s = String(p == null ? '/' : p);
@@ -39,10 +43,23 @@ function baseName(p) {
   return parts.length ? parts[parts.length - 1] : '';
 }
 
+/**
+ * Windows reserved device names (CON, PRN, AUX, NUL, COM1-9, LPT1-9) in any
+ * extension form ("CON", "con.txt", "aux.js"), case-insensitive. Such names
+ * resolve to kernel devices through the mount, making the file unreachable.
+ */
+const WIN_RESERVED = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])(\.|$)/i;
+
 /** Reject names that could escape the namespace or confuse path handling. */
 function assertValidName(name) {
   if (typeof name !== 'string' || name === '' || name === '.' || name === '..' ||
-      /[\/\\]/.test(name) || /[\x00-\x1f\x7f]/.test(name)) {
+      /[\/\\]/.test(name) || /[\x00-\x1f\x7f]/.test(name) ||
+      // Win32-illegal characters (a name containing these cannot be created
+      // through Explorer and breaks the cloud<->mount name mapping)
+      /[?*:"<>|]/.test(name) ||
+      WIN_RESERVED.test(name) ||
+      // leading space / trailing dot or space are silently mangled by Win32
+      /^ /.test(name) || /[. ]$/.test(name)) {
     throw httpError(409, 'invalid name');
   }
 }
@@ -72,6 +89,8 @@ class QuarkFs {
     this.inflight = new Map();
     /** per-path write serialization (concurrent PUTs must not race) */
     this._writeLocks = new Map();
+    /** @type {Map<string, {url: string, ts: number}>} pre-signed URL cache */
+    this._urlCache = new Map();
   }
 
   /** List a directory by fid with TTL cache + in-flight de-duplication. */
@@ -99,6 +118,14 @@ class QuarkFs {
   _cacheSet(fid, value) {
     // refresh insertion order (LRU-ish)
     this.dirCache.delete(fid);
+    // name index: first occurrence wins (matches the previous find() semantics)
+    const byName = new Map();
+    for (const e of value.entries) {
+      if (e && typeof e.file_name === 'string' && !byName.has(e.file_name)) {
+        byName.set(e.file_name, e);
+      }
+    }
+    value.byName = byName;
     this.dirCache.set(fid, value);
     if (this.dirCache.size <= DIR_CACHE_MAX) return;
     const now = this.now();
@@ -122,13 +149,24 @@ class QuarkFs {
     let fid = ROOT_FID;
     let entry = null;
     for (const name of parts) {
-      const entries = await this.listFid(fid);
-      const found = entries.find((e) => e && e.file_name === name);
+      // an intermediate component that is a file makes the rest of the path
+      // nonexistent — stop here instead of listing with a file's fid (which
+      // would surface upstream business errors as 500s)
+      if (entry && !isDirEntry(entry)) return null;
+      const found = await this._lookupChild(fid, name);
       if (!found) return null;
       entry = found;
       fid = String(found.fid);
     }
     return { fid, entry };
+  }
+
+  /** Look up one child by name using the cached name index when possible. */
+  async _lookupChild(fid, name) {
+    const entries = await this.listFid(fid);
+    const hit = this.dirCache.get(fid);
+    if (hit && hit.entries === entries && hit.byName) return hit.byName.get(name) || null;
+    return entries.find((e) => e && e.file_name === name) || null;
   }
 
   /**
@@ -163,17 +201,36 @@ class QuarkFs {
     };
   }
 
-  /** List a directory's children as stat objects. */
+  /**
+   * List a directory's children as stat objects.
+   *
+   * The stat array is cached alongside the raw entries (keyed by fid, tagged
+   * with the base path it was built for) so repeated PROPFIND depth-1 on the
+   * same directory — the Explorer-browsing hot path — does not rebuild
+   * thousands of stat objects each time. Callers MUST treat the returned
+   * array as read-only.
+   */
   async list(path) {
     const p = normalizePath(path);
     const res = await this.resolve(p);
     if (!res) return null;
     if (res.entry && !isDirEntry(res.entry)) return null; // not a directory
-    const entries = await this.listFid(res.fid);
+    const fid = res.fid;
+    const hit = this.dirCache.get(fid);
+    if (hit && this.now() - hit.ts < this.cacheTtlMs && hit.stats && hit.statsBase === p) {
+      return hit.stats;
+    }
+    const entries = await this.listFid(fid);
     const base = p === '/' ? '' : p;
-    return entries
+    const stats = entries
       .filter((e) => e && typeof e.file_name === 'string')
       .map((e) => this._entryToStat(base + '/' + e.file_name, e));
+    const entry = this.dirCache.get(fid);
+    if (entry && entry.entries === entries) {
+      entry.stats = stats;
+      entry.statsBase = p;
+    }
+    return stats;
   }
 
   /**
@@ -184,26 +241,41 @@ class QuarkFs {
   async createReadStream(path, range, opts = {}) {
     const st = await this.stat(path);
     if (!st || st.isDir) return null;
-    const { url } = await this.api.getDownloadUrl(st.fid);
-    const headers = {};
-    if (range) headers.Range = 'bytes=' + range.start + '-' + range.end;
-    // The download URL is pre-signed: never send the session cookie to the CDN
-    // host (noCookie), and let the caller abort us when the client disconnects.
-    const res = await this.http.request('GET', url, {
-      raw: true,
-      headers,
-      noCookie: true,
-      signal: opts.signal,
-      timeoutMs: opts.timeoutMs == null ? 30 * 60 * 1000 : opts.timeoutMs,
-    });
+
+    // Pre-signed CDN URLs are reused briefly: repeated opens of the same file
+    // (Explorer preview, rclone read-ahead re-opens) then cost no API round
+    // trip. A 403/404 from the CDN evicts the entry and retries once.
+    const open = async () => {
+      const { url } = await this._downloadUrl(st.fid);
+      const headers = {};
+      if (range) headers.Range = 'bytes=' + range.start + '-' + range.end;
+      // The download URL is pre-signed: never send the session cookie to the
+      // CDN host (noCookie), and let the caller abort us when the client
+      // disconnects.
+      return this.http.request('GET', url, {
+        raw: true,
+        headers,
+        noCookie: true,
+        signal: opts.signal,
+        timeoutMs: opts.timeoutMs == null ? 30 * 60 * 1000 : opts.timeoutMs,
+      });
+    };
+
+    let res = await open();
+    if ((res.status === 403 || res.status === 404) && this._urlCache.delete(st.fid)) {
+      res = await open(); // stale pre-signed URL — one retry with a fresh one
+    }
     if (res.status !== 200 && res.status !== 206) {
       throw new Error('download failed: http ' + res.status);
     }
     const mime = res.headers.get ? (res.headers.get('content-type') || '') : '';
     const name = st.name;
-    // Trust the upstream's own length when it tells us.
+    // Trust the upstream's own length when it tells us. NOTE: headers.get()
+    // returns null when absent and Number(null) === 0 — check for null first
+    // or a chunked (length-less) response would truncate the file to 0 bytes.
     let size = st.size;
-    const upstreamLen = res.headers.get ? Number(res.headers.get('content-length')) : NaN;
+    const lenHeader = res.headers.get ? res.headers.get('content-length') : null;
+    const upstreamLen = lenHeader == null ? NaN : Number(lenHeader);
     if (Number.isFinite(upstreamLen) && upstreamLen >= 0) size = upstreamLen;
     return {
       stream: Readable.fromWeb(res.response.body),
@@ -213,6 +285,19 @@ class QuarkFs {
       partial: res.status === 206,
       status: res.status,
     };
+  }
+
+  /** Cached pre-signed download URL for a fid (short TTL, bounded size). */
+  async _downloadUrl(fid) {
+    const hit = this._urlCache.get(fid);
+    if (hit && this.now() - hit.ts < URL_CACHE_TTL_MS) return hit;
+    const { url, size } = await this.api.getDownloadUrl(fid);
+    this._urlCache.set(fid, { url, size: size || 0, ts: this.now() });
+    if (this._urlCache.size > URL_CACHE_MAX) {
+      const oldest = this._urlCache.keys().next().value;
+      this._urlCache.delete(oldest);
+    }
+    return { url, size: size || 0 };
   }
 
   /**
@@ -232,12 +317,16 @@ class QuarkFs {
 
     const prev = this._writeLocks.get(p) || Promise.resolve();
     const run = prev.then(() => this._writeFileLocked(p, name, stream, size, opts));
-    // keep the chain alive but never let a failure poison later writes
-    this._writeLocks.set(p, run.catch(() => {}));
+    // keep the chain alive but never let a failure poison later writes.
+    // The SAME guarded promise must be stored and compared — run.catch()
+    // allocates a new promise on every call, so comparing against a fresh
+    // one would never match and the map entry would leak forever.
+    const guarded = run.catch(() => {});
+    this._writeLocks.set(p, guarded);
     try {
       return await run;
     } finally {
-      if (this._writeLocks.get(p) === run.catch(() => {})) this._writeLocks.delete(p);
+      if (this._writeLocks.get(p) === guarded) this._writeLocks.delete(p);
     }
   }
 
@@ -313,8 +402,11 @@ class QuarkFs {
     const res = await this.resolve(p);
     if (!res || !res.entry) throw httpError(404, 'not found');
     await this.api.remove([res.fid]);
-    this.invalidate(ROOT_FID);
-    this.invalidate(await this._parentFidOf(p));
+    // Only the DIRECT parent is stale (the entry moved out of it); the root
+    // listing is unaffected unless the parent IS the root.
+    const parentFid = await this._parentFidOf(p);
+    this.invalidate(parentFid);
+    if (parentFid === ROOT_FID) this.invalidate(ROOT_FID);
     return {};
   }
 
@@ -341,21 +433,27 @@ class QuarkFs {
     const dstRes = await this.resolve(dst);
     if (dstRes && dstRes.entry && !isDirEntry(dstRes.entry)) {
       // Replacing an existing file. Done without a data-loss window:
-      // move to a temporary name, delete the old file, then rename.
+      // move to the destination parent, rename to a temporary name, delete
+      // the old file, then rename to the final name. Every step is inside
+      // the retry loop with a FRESH temp name each attempt (a leftover
+      // .quarkdrive-tmp-* from an earlier failure must not collide), and
+      // the failure path reports where the file actually landed.
       if (!opts.overwrite) throw httpError(409, 'destination exists');
       const parentRes = await this.resolve(parentOf(dst));
       if (!parentRes) throw httpError(409, 'destination parent not found');
       const finalName = baseName(dst);
       assertValidName(finalName);
-      const tmpName = '.quarkdrive-tmp-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8);
-      await this.api.move([srcRes.fid], parentRes.fid);
-      await this.api.rename(srcRes.fid, tmpName);
+      const srcFid = String(srcRes.fid);
+      const oldFid = String(dstRes.entry.fid);
       let renamed = false;
       let lastErr = null;
       for (let attempt = 0; attempt < 3 && !renamed; attempt++) {
+        const tmpName = '.quarkdrive-tmp-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8);
         try {
-          await this.api.remove([String(dstRes.entry.fid)]);
-          await this.api.rename(srcRes.fid, finalName);
+          await this.api.move([srcFid], parentRes.fid);
+          await this.api.rename(srcFid, tmpName);
+          await this.api.remove([oldFid]);
+          await this.api.rename(srcFid, finalName);
           renamed = true;
         } catch (e) {
           lastErr = e;
@@ -363,10 +461,17 @@ class QuarkFs {
         }
       }
       if (!renamed) {
-        // best effort: leave the source under its temp name rather than lose it
-        this.logger.warn('replace move failed, file kept as ' + tmpName + ': ' + (lastErr && lastErr.message));
+        // Never claim a state we did not verify: look up where the file
+        // really is so the log matches reality for recovery.
+        const landedAs = await this._nameOfInDir(parentRes.fid, srcFid);
+        this.logger.warn('replace move failed: file ' + srcFid + ' is in the destination directory as ' +
+          JSON.stringify(landedAs) + ' (' + (lastErr && lastErr.message) + ')');
         this.invalidate(parentRes.fid);
-        throw httpError(500, 'replace failed');
+        this.invalidate(await this._parentFidOf(src));
+        // Rethrow the ORIGINAL failure (not a generic wrapper): callers and
+        // tests match on it, and the WebDAV layer maps plain errors to a
+        // generic client-facing message (F-15).
+        throw lastErr || httpError(500, 'replace failed');
       }
       this.invalidate(parentRes.fid);
       this.invalidate(await this._parentFidOf(src));
@@ -380,8 +485,9 @@ class QuarkFs {
       return {};
     }
     // target does not exist: move into the parent first, then rename. If the
-    // rename fails the file is merely left with its old name in the right
-    // directory — never silently misplaced.
+    // rename fails we roll the name back and report failure — silently
+    // leaving the file under its old name would make the client 404 on a
+    // destination it was told had succeeded.
     const parentRes = await this.resolve(parentOf(dst));
     if (!parentRes) throw httpError(409, 'destination parent not found');
     assertValidName(baseName(dst));
@@ -390,6 +496,14 @@ class QuarkFs {
       await this.api.rename(srcRes.fid, baseName(dst));
     } catch (e) {
       this.logger.warn('move: rename after move failed for ' + srcRes.fid + ': ' + e.message);
+      try {
+        await this.api.rename(srcRes.fid, baseName(src)); // roll the name back
+      } catch (e2) {
+        this.logger.warn('move: rollback rename also failed for ' + srcRes.fid + ': ' + e2.message);
+      }
+      this.invalidate(parentRes.fid);
+      this.invalidate(await this._parentFidOf(src));
+      throw httpError(500, 'move failed after transfer');
     }
     this.invalidate(parentRes.fid);
     this.invalidate(await this._parentFidOf(src));
@@ -399,6 +513,17 @@ class QuarkFs {
   async _parentFidOf(path) {
     const res = await this.resolve(parentOf(path));
     return res ? res.fid : ROOT_FID;
+  }
+
+  /** Fresh lookup of an entry's current name inside a directory (by fid). */
+  async _nameOfInDir(dirFid, targetFid) {
+    try {
+      const entries = await this.listFid(dirFid, { fresh: true });
+      const found = entries.find((e) => String(e.fid) === String(targetFid));
+      return found ? found.file_name : null;
+    } catch (_e) {
+      return null;
+    }
   }
 }
 

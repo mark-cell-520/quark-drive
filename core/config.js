@@ -18,12 +18,21 @@ const DEFAULT_SETTINGS = {
   driveLetter: 'Q',
   autoMount: true,
   startWithWindows: false,
+  startMinimized: false,
   webdavPort: 9798,
   rclonePath: '', // empty = auto-detect (PATH then vendor/)
   mountOptions: {
     vfsCacheMode: 'writes',
     dirCacheTime: '5m',
     bufferSize: '64M',
+    // Bound the on-disk VFS cache (rclone's default is unlimited)
+    vfsCacheMaxSize: '10G',
+    // Flush pending writes quickly (graceful unmount covers the rest)
+    vfsWriteBack: '5s',
+    // Smaller read chunks + parallel streams: smoother sequential reads and
+    // far less waste on preview/seek than rclone's 128 MiB default chunk
+    vfsReadChunkSize: '16M',
+    vfsReadChunkStreams: 8,
   },
 };
 
@@ -136,6 +145,8 @@ class ConfigStore {
 function deepMerge(base, patch) {
   const out = Array.isArray(base) ? base.slice() : { ...base };
   for (const [k, v] of Object.entries(patch || {})) {
+    // never let a JSON-parsed __proto__/constructor key redefine prototypes
+    if (k === '__proto__' || k === 'constructor' || k === 'prototype') continue;
     if (v && typeof v === 'object' && !Array.isArray(v) && out[k] && typeof out[k] === 'object' && !Array.isArray(out[k])) {
       out[k] = deepMerge(out[k], v);
     } else if (v !== undefined) {

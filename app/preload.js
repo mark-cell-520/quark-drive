@@ -18,6 +18,8 @@ const INVOKE_CHANNELS = [
   'settings:get',
   'settings:set',
   'app:openLogs',
+  'app:openDrive',
+  'app:quit',
   'app:version',
 ];
 
@@ -28,6 +30,7 @@ const EVENT_CHANNELS = [
   'auth:done',
   'auth:error',
   'drive:state',
+  'drive:transfers',
   'drive:error',
 ];
 

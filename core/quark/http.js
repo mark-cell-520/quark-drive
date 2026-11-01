@@ -120,6 +120,50 @@ const COOKIE_HOSTS = new Set([
   'quark.cn',
 ]);
 
+/**
+ * Wrap a web ReadableStream with an idle timeout: if no chunk arrives within
+ * `ms`, the stream is errored AND the fetch aborted. The timer rearms on
+ * every chunk and is cleared when the stream ends or is cancelled.
+ */
+function idleWatchdog(body, ms, ac) {
+  let timer = null;
+  let ctrl = null;
+  const disarm = () => { if (timer) { clearTimeout(timer); timer = null; } };
+  const fail = (err) => {
+    disarm();
+    try { if (ac) ac.abort(err); } catch (_e) { /* already aborted */ }
+    try { if (ctrl) ctrl.error(err); } catch (_e) { /* already closed */ }
+  };
+  const arm = () => {
+    if (timer) clearTimeout(timer);
+    timer = setTimeout(() => fail(new Error('response body stalled after ' + ms + 'ms')), ms);
+    if (typeof timer.unref === 'function') timer.unref();
+  };
+  const reader = body.getReader();
+  return new ReadableStream({
+    start(controller) { ctrl = controller; arm(); },
+    async pull(controller) {
+      try {
+        const { done, value } = await reader.read();
+        if (done) {
+          disarm();
+          controller.close();
+          return;
+        }
+        arm();
+        controller.enqueue(value);
+      } catch (e) {
+        disarm();
+        controller.error(e);
+      }
+    },
+    async cancel(reason) {
+      disarm();
+      try { await reader.cancel(reason); } catch (_e) { /* ignore */ }
+    },
+  });
+}
+
 class HttpClient {
   /**
    * @param {{
@@ -185,10 +229,12 @@ class HttpClient {
       const timeoutMs = opts.timeoutMs || this.timeoutMs;
       /** @type {ReturnType<typeof setTimeout>|null} */
       let timer = null;
+      /** @type {AbortController|null} */
+      let ac = null;
       const signals = [opts.signal].filter(Boolean);
       let signal = undefined;
       if (timeoutMs > 0 || signals.length) {
-        const ac = new AbortController();
+        ac = new AbortController();
         signal = ac.signal;
         for (const s of signals) {
           if (s.aborted) ac.abort(s.reason);
@@ -229,14 +275,30 @@ class HttpClient {
         continue;
       }
 
-      if (opts.raw) return this._finish(response, url, opts);
+      if (opts.raw) return this._finish(response, url, opts, ac, timeoutMs);
       const body = Buffer.from(await response.arrayBuffer());
       return { status: response.status, headers: response.headers, url: url.toString(), body, response };
     }
   }
 
-  _finish(response, url, _opts) {
-    return { status: response.status, headers: response.headers, url: url.toString(), body: null, response };
+  /**
+   * Wrap a streaming (raw) response so the body is covered by an idle
+   * watchdog: the header-phase timeout is cleared as soon as headers arrive,
+   * but a CDN connection that goes half-open mid-transfer would otherwise
+   * hold the socket forever. No bytes for `timeoutMs` aborts the fetch.
+   */
+  _finish(response, url, opts, ac, timeoutMs) {
+    let resp = response;
+    const canWrap = opts.raw && timeoutMs > 0 && ac &&
+      response.body && response.status !== 204 && response.status !== 304;
+    if (canWrap) {
+      resp = new Response(idleWatchdog(response.body, timeoutMs, ac), {
+        status: response.status,
+        statusText: response.statusText,
+        headers: response.headers,
+      });
+    }
+    return { status: response.status, headers: response.headers, url: url.toString(), body: null, response: resp };
   }
 
   /**

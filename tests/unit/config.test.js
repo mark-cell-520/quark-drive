@@ -19,6 +19,11 @@ test('defaults cover the documented settings', () => {
   assert.equal(DEFAULT_SETTINGS.driveLetter, 'Q');
   assert.equal(DEFAULT_SETTINGS.webdavPort, 9798);
   assert.equal(DEFAULT_SETTINGS.mountOptions.vfsCacheMode, 'writes');
+  // fluidity defaults forwarded to rclone
+  assert.equal(DEFAULT_SETTINGS.mountOptions.bufferSize, '64M');
+  assert.equal(DEFAULT_SETTINGS.mountOptions.vfsCacheMaxSize, '10G');
+  assert.equal(DEFAULT_SETTINGS.mountOptions.vfsReadChunkStreams, 8);
+  assert.equal(DEFAULT_SETTINGS.startMinimized, false);
 });
 
 test('session round-trip and clear', () => {

@@ -175,3 +175,40 @@ test('redactQrUrl strips the live token', () => {
   assert.match(red, /token=%3Credacted%3E/);
   assert.equal(redactQrUrl('not a url'), '<scan-url>');
 });
+
+test('N-3: start/poll/complete forward the abort signal to HTTP', async () => {
+  const http = fakeHttp([
+    { match: 'getTokenForQrcodeLogin', response: OK_TOKEN },
+    { match: 'getServiceTicketByQrcodeToken', response: { status: 50004001 } },
+    { match: 'desktop/account/login', response: { status: 200, headers: new Map(), body: Buffer.from('') } },
+  ]);
+  http.cookieJar.ingest(['__puus=s; Path=/']);
+  const ac = new AbortController();
+  const login = new QrLogin({ http, device: makeDevice() });
+  await login.start({ signal: ac.signal });
+  assert.equal(http.calls[0].opts.signal, ac.signal, 'start must forward the signal');
+  await login.poll({ signal: ac.signal });
+  assert.equal(http.calls[1].opts.signal, ac.signal, 'poll must forward the signal');
+  await login.complete('st', { signal: ac.signal });
+  assert.equal(http.calls[2].opts.signal, ac.signal, 'complete must forward the signal');
+});
+
+test('N-3: an abort during an in-flight poll rejects the flow immediately', async () => {
+  const ac = new AbortController();
+  const http = {
+    cookieJar: new CookieJar(),
+    async requestJson(method, url, opts) {
+      if (url.includes('getTokenForQrcodeLogin')) return OK_TOKEN;
+      // poll hangs until the signal fires — exactly what HttpClient does
+      // with a real fetch when the caller aborts
+      return new Promise((_resolve, reject) => {
+        opts.signal.addEventListener('abort', () => reject(new Error('aborted')), { once: true });
+      });
+    },
+    async request() { throw new Error('should not reach'); },
+  };
+  const login = new QrLogin({ http, device: makeDevice() });
+  const p = login.run({ intervalMs: 1, sleep: async () => {}, signal: ac.signal });
+  setTimeout(() => ac.abort(), 20);
+  await assert.rejects(p, /aborted/);
+});

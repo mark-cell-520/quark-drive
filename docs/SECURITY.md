@@ -32,18 +32,22 @@
 
 ### 4. 进程与命令
 - rclone 以数组参数 spawn（无 shell），盘符 `^[A-Za-z]$` 校验，`--cache-dir` 等均为独立 argv
+- **RC 端点每运行随机 Basic auth 凭证**：`rclone rcd` 不用 `--rc-no-auth`；无凭证请求（含浏览器 CORS simple request）一律 401，杜绝"借受害者身份枚举文件系统/卸载盘符"
 - 挂载就绪/卸载走 RC HTTP API，不 spawn 辅助进程（Electron 的 `process.execPath` 不是 node）
+- 挂载/卸载/服务器操作串行化（在途锁 + 生成令牌），失败尝试只清除自己发布的状态——孤儿 rclone 会长期占用盘符
+- `findRclone`/`checkWinFsp` 异步执行（同步 `execFileSync` 会冻结 UI ~165ms）
 
 ### 5. 路径与名称
-- 写入名称过 `assertValidName`（拒分隔符/`.`/`..`/控制字符）
+- 写入名称过 `assertValidName`（拒分隔符/`.`/`..`/控制字符/`?*:"<>|`/Windows 保留设备名 CON·PRN·AUX·NUL·COM1-9·LPT1-9/尾随点空格/前导空格）
 - 路径→fid 按名精确查找，`..`/`%2F`/反斜杠/双重解码均无法穿越命名空间（原始 socket 级测试验证）
 - XML 输出剥离 XML 1.0 非法字符（存量脏名不产生畸形 207）
 
 ### 6. 数据完整性
 - 覆盖写入 = 先传后删（无"删了没传上"窗口）
 - 同路径写串行化；删旧前重拉列表确认
-- MOVE 不预删目标；自移动 403；替换走临时名三步（带重试，失败保留可恢复）
+- MOVE 不预删目标；自移动 403；替换走临时名三步（带重试，失败按真实落点记录且原始错误上抛）
 - 优雅卸载（RC unmount）先 flush VFS 待传队列
+- logout 重置内存 Cookie 罐并停止 WebDAV 服务（URL 前缀即访问凭证）
 
 ### 7. 供应链
 - 运行时依赖仅 `qrcode`（npm audit 生产依赖 0 漏洞）

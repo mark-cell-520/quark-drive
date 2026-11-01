@@ -34,6 +34,30 @@ test('A-01: chunked PUT above the configured cap is rejected with 413', async ()
   }
 });
 
+test('A-03: a LARGE chunked body still receives the 413 (not ECONNRESET)', async () => {
+  // The cap must be enforced by answering first and then draining: a client
+  // uploading 4 MB against a 64 KiB cap used to get a reset connection with
+  // no response at all (it could not tell "too large" from "network error").
+  const quark = new FakeQuark();
+  const qfs = new QuarkFs({ api: quark, uploader: new FakeUploader(quark), http: new FakeDownloadHttp(quark) });
+  const server = createWebDavServer({ fs: qfs, host: '127.0.0.1', port: 0, maxChunkedBodyBytes: 64 * 1024, logger: { debug() {}, warn() {}, error() {} } });
+  const port = await server.listenAsync(0);
+  try {
+    // 4 MB in 64 KiB chunks — many chunks arrive after the cap is exceeded
+    const chunks = [];
+    for (let i = 0; i < 64; i++) chunks.push(Buffer.alloc(64 * 1024, 0x42));
+    const res = await fetch('http://127.0.0.1:' + port + server.urlPrefix + '/big.bin', {
+      method: 'PUT',
+      body: ReadableStreamFrom(chunks),
+      duplex: 'half',
+    });
+    assert.equal(res.status, 413);
+    assert.match(await res.text(), /too large/);
+  } finally {
+    await server.closeAsync();
+  }
+});
+
 test('A-01: default chunked cap is 256 MiB and exported for reference', () => {
   assert.equal(MAX_CHUNKED_BODY_BYTES, 256 * 1024 * 1024);
 });

@@ -136,6 +136,48 @@ test('raw mode returns the response for streaming downloads', async () => {
   assert.ok(out.response);
 });
 
+test('N-5: raw download body has an idle watchdog (headers-only timeout is not enough)', async () => {
+  const { Readable } = require('node:stream');
+  // a body that never produces a byte: only a body-level timeout can save us
+  const stalling = new Readable({ read() { /* never pushes */ } });
+  const http = new HttpClient({
+    fetchImpl: async () => new Response(Readable.toWeb(stalling), {
+      status: 200,
+      headers: { 'content-type': 'application/octet-stream' },
+    }),
+  });
+  const t0 = Date.now();
+  const out = await http.request('GET', 'https://cdn.example.com/f', { raw: true, timeoutMs: 150 });
+  // headers resolve promptly...
+  assert.equal(out.status, 200);
+  assert.ok(Date.now() - t0 < 100, 'headers must not wait for the body');
+  // ...but the body must eventually error instead of hanging forever
+  await assert.rejects(
+    (async () => { for await (const _c of Readable.fromWeb(out.response.body)) { /* drain */ } })(),
+    /stalled|abort/i,
+  );
+});
+
+test('N-5: raw body watchdog rearms on data and clears on completion', async () => {
+  const { Readable } = require('node:stream');
+  let pushed = false;
+  const body = new Readable({
+    read() {
+      if (pushed) return;
+      pushed = true;
+      this.push(Buffer.from('chunk'));
+      setTimeout(() => this.push(null), 50);
+    },
+  });
+  const http = new HttpClient({
+    fetchImpl: async () => new Response(Readable.toWeb(body), { status: 200, headers: {} }),
+  });
+  const out = await http.request('GET', 'https://cdn.example.com/f', { raw: true, timeoutMs: 300 });
+  let bytes = 0;
+  for await (const c of Readable.fromWeb(out.response.body)) bytes += c.length;
+  assert.equal(bytes, 5);
+});
+
 test('query params: undefined/null values are skipped', async () => {
   const seen = [];
   const http = new HttpClient({

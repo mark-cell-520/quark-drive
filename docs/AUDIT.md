@@ -3,7 +3,6 @@
 > 审计日期：2026-11-02 · 范围：全部核心代码 + Electron 外壳 + 安装器脚本
 > 方法：独立审查代理（全新上下文、可复现 harness 实证）+ 维护者自查 + 静态扫描 + `npm audit`
 > 结果：**18 项发现全部修复，157 项测试全绿，真实挂载冒烟通过**
-
 ---
 
 ## 1. 审计方法
@@ -140,3 +139,68 @@ npm audit --omit=dev             → 0 vulnerabilities
 
 - 本沙箱禁止 GUI 进程启动：**Electron 应用窗口与 NSIS 安装器无法在此环境执行**（二进制本身验证正常：`ELECTRON_RUN_AS_NODE` 模式可用；安装器构建、asar 内容、NSIS 脚本编译均通过）。应用代码用契约测试（IPC 通道/DOM ID/按钮绑定/BrowserWindow 加固）静态验证。
 - 真实夸克账号的登录后操作（列目录/下载/上传端到端）需要真人扫码；本机已验证到「等待扫码」状态（getToken 真令牌 + 轮询 waiting + 无会话 403 鉴权检测），其余路径按参考实现的响应结构做 mock 回归。
+
+---
+
+# 第二轮审计（2026-11-02，遗留 / 新引入 / 上轮遗漏）
+
+> 方法：三个独立子代理（安全 / 正确性健壮性 / 性能），全新上下文，只读审计 +
+> 可运行 harness 实证（安全 11 个、正确性 15 个、性能 10 个基准脚本）。
+> 基线：158/158 测试全绿。结果：**25 项发现（9 安全 + 16 正确性）全部修复，
+> 191 项测试全绿；另完成一轮性能优化（见 docs/PERFORMANCE.md）。**
+
+## 安全发现（N 系列）
+
+| # | 级别 | 发现 | 修复 |
+|---|---|---|---|
+| N-1 | HIGH | rclone RC 守护进程 `--rc-no-auth`：同机任意进程/浏览器页（CORS simple request，URL query 传参）可枚举本地文件系统、以受害者身份 mount/unmount 盘符 | 每次挂载生成随机 `--rc-user`/`--rc-pass`，`_rcPost` 带 Basic auth |
+| N-2 | MEDIUM | 并发挂载竞态：孤儿 rclone 长期占用盘符；失败方清空健康挂载状态；`startServer` 并发留下未监听对象导致 `address()` TypeError | MountManager 在途锁（并发调用合并为一次尝试）+ 生成令牌（仅清除本尝试发布的状态）+ main.js 串行化 server/mount/unmount |
+| N-3 | LOW | `auth:cancelLogin` 不中止在途请求，"刷新二维码"最长 30s 静默失效 | signal 透传至 start/poll/complete 的每个 HTTP 调用；取消后等待旧循环真正结束 |
+| N-4 | LOW | `auth:logout` 不清内存 Cookie 罐、不停 WebDAV 服务——取得过本次运行 URL 前缀的本机进程在"退出登录"后仍可读写网盘 | logout 重置 cookieJar + closeAsync 停服务 + 中止在途登录 |
+| N-5 | LOW | raw 流式下载的 30 分钟兜底超时不覆盖 body（头到达即清 timer），CDN 半开即永久占 socket | body 级空闲看门狗（无字节 N ms 即 abort，chunk 到达重置） |
+| N-6 | LOW | `_writeLocks` 清理条件恒假（`run.catch()` 每次新对象），Map 无界增长 | 存储并比较同一个 guarded promise |
+| N-7 | LOW | `assertValidName` 放过 Windows 保留设备名（CON/PRN/AUX/NUL/COM1-9/LPT1-9）、尾随点/空格、`?*:"<>|` | 拒绝上述全部（含任意扩展名形态，大小写不敏感） |
+| N-8 | LOW | MOVE 替换的临时名在重试环外；失败态与日志描述不符 | 临时改名纳入重试（每次新临时名）；失败时按真实落点记录；原始错误向上传播 |
+| N-9 | LOW | （性能重构引入）快速 `rfc1123` 对负年份产出 `0-323` 畸形日期 | 负年份加符号；与 `toUTCString` 全量差分测试守护 |
+
+## 正确性发现（A 系列）
+
+| # | 级别 | 发现 | 修复 |
+|---|---|---|---|
+| A-1 | HIGH | `_waitDownloadTask` 的 `continue` 在截止检查之前，`data:null` 时无限轮询、请求永不返回 | 空 data 分支先查截止时间 |
+| A-2 | MEDIUM | 上游缺 `Content-Length` 时 `Number(null)===0`，文件被截断为 0 字节 | 先判空再转换 |
+| A-3 | MEDIUM | 超限 chunked PUT 的 413 到不了客户端（`Connection: close` + destroy → ECONNRESET，无法区分"文件太大"与"网络故障"） | 先响应 413 再排空 body，保持 keep-alive |
+| A-4 | MEDIUM | （同 N-6）writeLocks 无界增长 | 同 N-6 |
+| A-5 | MEDIUM | MOVE 新路径分支 rename 失败仍报成功（静默错位，客户端随后 404） | 回滚改名并抛 500 |
+| A-6 | MEDIUM | MOVE 替换失败不失效源父目录 → 幽灵条目 | 失败分支一并失效源父目录 |
+| A-7 | MEDIUM | `listDirAll` 200 页上限静默截断大目录 | `_size` 500、上限 1000 页、截断告警 |
+| A-8 | LOW | `parseRange` 在 size===0 时跳过边界检查（空文件 Range → 上游 416 → 502） | `size != null` 判据 |
+| A-9 | LOW | `destinationPath` 按字符串前缀剥离（`/dav` 吃 `/david`）；不校验 Destination 主机 | 分段剥离 + 拒绝异主机 Destination（RFC 4918） |
+| A-10 | LOW | 目录 HTML 列表相对链接在子目录下指错 | `./` 前缀 |
+| A-11 | LOW | PUT 与 GET/PROPFIND 的 ETag 不一致 | PUT 响应使用 stat 的同一 etag |
+| A-12 | LOW | `resolve()` 不校验中间组件是目录 → 500 代替 404 | 循环内拒绝非目录中间组件 |
+| A-13 | LOW | `execFileSync` 同步阻塞主进程 ~165ms；rclone 意外退出不清状态不通知 | 异步化 + onExit 清状态 + onStateChange 通知 UI |
+| A-14 | LOW | `update/hash` 传输错误直接终止上传（分片已全部上传成功） | 非 AuthError 降级为正常 commit |
+| A-15 | LOW | `commit` 的 callback 编码三分支不一致（数字会 base64 成非法回调） | 统一归一化：string 原样 / object 序列化 / 其他丢弃 |
+| A-16 | LOW | `unlink` 无条件失效根目录缓存（多余 API 调用） | 仅父目录是根时失效根 |
+
+## 本轮基础设施与功能改进
+
+- 稳定性测试套件 `tests/stability/soak.test.js`：100 并发 PROPFIND 风暴、混合并发
+  读写列目录、下载中途断连 abort 上游、10 类畸形请求、keep-alive 复用、写入锁/缓存残留。
+- 性能基准 `scripts/bench.js` 成为仓库常驻资产（见 docs/PERFORMANCE.md）。
+- 安装器：WinFsp MSI 安装加日志（`%TEMP%\quarkdrive-winfsp-install.log`）、
+  瞬时失败重试一次、安装后存在性验证与明确告警。
+- UX：挂载中状态与按钮禁用、传输进度行（rclone RC core/transfers 轮询）、
+  二维码有效期倒计时、友好错误文案、打开盘符、退出应用（先卸载）、
+  启动最小化到托盘、托盘菜单反映挂载状态。
+- `deepMerge` 拒绝 `__proto__`/`constructor` 键。
+
+## 环境限制（诚实边界）
+
+本沙箱实测：**回环连接的响应方向无法到达非 Node 子进程**（rclone 的请求到达
+服务器且服务器正常响应，但 rclone 侧超时收不到；Node 进程间回环正常）。
+因此本轮**未能执行真实 rclone 挂载冒烟**；挂载相关改动依靠：rclone v1.75.2
+选项名静态核验（`rclone help flags` 逐一确认）、假 RC 端点到端测试（新 vfsOpt
+全量断言 + Basic auth 断言）、以及协议语义差分测试来保证。第一轮报告中"真实挂载
+通过"的记录来自此前环境，仍然有效但非本轮产生。

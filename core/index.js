@@ -244,12 +244,12 @@ async function cli(argv) {
       console.log('config dir : ' + config.baseDir);
       console.log('session    : ' + (session ? 'present' : 'MISSING (run: quark-drive login)'));
       try {
-        const rclone = mount.findRclone();
+        const rclone = await mount.findRclone();
         console.log('rclone     : ' + rclone);
       } catch (e) {
         console.log('rclone     : NOT FOUND — ' + e.message);
       }
-      const w = mount.checkWinFsp();
+      const w = await mount.checkWinFsp();
       console.log('winfsp     : ' + (w.ok ? 'OK' : 'MISSING — ' + w.reason));
       console.log('settings   : drive=' + settings.driveLetter + ' port=' + settings.webdavPort);
       return 0;

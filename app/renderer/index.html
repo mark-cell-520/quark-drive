@@ -25,7 +25,7 @@
         <div id="qr-placeholder" class="qr-placeholder">二维码加载中…</div>
       </div>
       <p id="login-status" class="status">等待初始化…</p>
-      <div class="row">
+      <p id="qr-expiry" class="hint hidden"></p>      <div class="row">
         <button id="btn-refresh-qr" class="btn secondary" type="button">刷新二维码</button>
         <button id="btn-cancel-login" class="btn secondary" type="button">取消</button>
       </div>
@@ -54,11 +54,13 @@
     <div class="card">
       <h2>硬盘挂载</h2>
       <div id="mount-state" class="mount-state">未挂载</div>
+      <div id="transfer-line" class="transfer-line hidden"></div>
       <div class="row">
         <label for="sel-letter">盘符</label>
         <select id="sel-letter"></select>
         <button id="btn-mount" class="btn primary" type="button">挂载</button>
         <button id="btn-unmount" class="btn danger hidden" type="button">卸载</button>
+        <button id="btn-open-drive" class="btn secondary hidden" type="button">打开</button>
       </div>
       <p id="mount-hint" class="hint">挂载后可在文件资源管理器中像本地磁盘一样浏览夸克网盘。</p>
     </div>
@@ -73,10 +75,16 @@
         <input type="checkbox" id="chk-autostart">
         <span>开机自动启动（最小化到托盘）</span>
       </label>
+      <label class="checkbox">
+        <input type="checkbox" id="chk-startmin">
+        <span>启动时最小化到托盘（不显示主窗口）</span>
+      </label>
       <div class="row">
         <button id="btn-logs" class="btn secondary small" type="button">打开日志目录</button>
+        <button id="btn-quit" class="btn danger small" type="button">退出应用</button>
         <span id="version" class="version"></span>
       </div>
+      <p class="hint">关闭窗口只是最小化到托盘；退出会先安全卸载盘符。</p>
     </div>
   </section>
 

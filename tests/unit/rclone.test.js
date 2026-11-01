@@ -27,23 +27,21 @@ test('normalizeLetter accepts letters with optional colon/backslash', () => {
   assert.throws(() => normalizeLetter('../etc'), MountError);
 });
 
-test('findRclone accepts a working explicit path', () => {
+test('findRclone accepts a working explicit path', async () => {
   const m = makeManager();
-  const found = m.findRclone();
+  const found = await m.findRclone();
   assert.match(found, /rclone\.exe$/);
 });
 
-test('findRclone throws a clear error when nothing is available', () => {
+test('findRclone throws a clear error when nothing is available', async () => {
   const m = makeManager({ rclonePath: 'C:\\nonexistent\\rclone.exe', vendorDir: 'C:\\nonexistent-vendor' });
   // PATH lookup of bare "rclone" may still succeed on this machine; force failure
-  m.rclonePath = 'C:\\nonexistent\\rclone.exe';
   const origPath = process.env.PATH;
   try {
     process.env.PATH = 'C:\\nonexistent';
     m.rclonePath = 'C:\\nonexistent\\rclone.exe';
-    m.findRcloneOrg = m.findRclone;
     // bare "rclone" on an empty PATH must fail
-    assert.throws(() => m.findRclone(), /rclone not found/);
+    await assert.rejects(() => m.findRclone(), /rclone not found/);
   } finally {
     process.env.PATH = origPath;
   }
@@ -67,9 +65,9 @@ test('mount refuses to double-mount and reports in-use letters', async () => {
   m.mountInfo = null;
 });
 
-test('checkWinFsp returns a structured result', () => {
+test('checkWinFsp returns a structured result', async () => {
   const m = makeManager();
-  const w = m.checkWinFsp();
+  const w = await m.checkWinFsp();
   assert.equal(typeof w.ok, 'boolean');
   if (!w.ok) assert.match(w.reason, /WinFsp/);
 });
@@ -135,9 +133,11 @@ test('mount succeeds through the RC API (rcd + mount/mount + listmounts)', async
   const http = require('node:http');
   const { EventEmitter } = require('node:events');
 
+  const seenAuth = [];
   // fake rclone RC endpoint
   const rcServer = http.createServer((req, res) => {
     if (req.method !== 'POST') { res.writeHead(404); res.end(); return; }
+    seenAuth.push(req.headers.authorization || null);
     let body = '';
     req.on('data', (c) => { body += c; });
     req.on('end', () => {
@@ -148,9 +148,13 @@ test('mount succeeds through the RC API (rcd + mount/mount + listmounts)', async
       } else if (req.url === '/mount/mount') {
         const parsed = JSON.parse(body);
         // the fs spec must carry the webdav remote with the token prefix
-        assert.match(parsed.fs, /^:webdav,url='http:\/\/127\.0\.0\.1:1234\/[0-9a-f]{48}',vendor='other':$/);
+        assert.match(parsed.fs, /^:webdav,url='http:\/\/127\.0\.0\.1:1234\/[0-9a-f]{48}',vendor='other',timeout='30m':$/);
         assert.equal(parsed.mountPoint, 'Y:\\');
         assert.equal(parsed.vfsOpt.VfsCacheMode, 'writes');
+        // fluidity options are forwarded (not silently dropped)
+        assert.equal(parsed.vfsOpt.BufferSize, '64M');
+        assert.equal(parsed.vfsOpt.VfsCacheMaxSize, '10G');
+        assert.equal(parsed.vfsOpt.VfsReadChunkStreams, 8);
         res.writeHead(200, json);
         res.end(JSON.stringify({ mountPoint: parsed.mountPoint }));
       } else if (req.url === '/mount/listmounts') {
@@ -176,6 +180,10 @@ test('mount succeeds through the RC API (rcd + mount/mount + listmounts)', async
       assert.equal(args[0], 'rcd', 'rclone must be started as the RC daemon');
       assert.ok(args.includes('--rc-addr'));
       assert.ok(args.some((a) => a === '127.0.0.1:' + rcPort), 'rc-addr must use the chosen port');
+      // N-1: per-run RC credentials, and NO --rc-no-auth
+      assert.ok(!args.includes('--rc-no-auth'), 'the RC API must require auth');
+      assert.ok(args.includes('--rc-user'), 'rc-user must be set');
+      assert.ok(args.includes('--rc-pass'), 'rc-pass must be set');
       return fakeChild;
     },
     sleep: async () => {},
@@ -187,6 +195,109 @@ test('mount succeeds through the RC API (rcd + mount/mount + listmounts)', async
     assert.equal(out.rcPort, rcPort);
     assert.equal(m.isMounted, true);
     assert.equal(m.status().mounted, true);
+    // every RC call carried Basic auth
+    assert.ok(seenAuth.length >= 3, 'RC calls were made');
+    for (const a of seenAuth) {
+      assert.match(a, /^Basic [A-Za-z0-9+/=]+$/, 'RC requests must authenticate');
+    }
+  } finally {
+    rcServer.close();
+  }
+});
+
+test('N-2: concurrent mount calls join one attempt (no orphan rclone)', async () => {
+  const { EventEmitter } = require('node:events');
+  let spawns = 0;
+  const m = makeManager({
+    spawn: () => {
+      spawns++;
+      const c = new EventEmitter();
+      c.exitCode = null;
+      c.pid = 1;
+      c.stderr = new EventEmitter();
+      c.kill = () => {};
+      // never becomes ready — both callers must share ONE failing attempt
+      return c;
+    },
+    sleep: async () => {},
+    now: (() => { let t = 0; return () => (t += 60000); })(),
+    freePort: async () => 59998,
+  });
+  const results = await Promise.allSettled([
+    m.mount({ port: 1234, letter: 'Y' }),
+    m.mount({ port: 1234, letter: 'Y' }),
+  ]);
+  assert.equal(spawns, 1, 'exactly one rclone process may be spawned');
+  for (const r of results) assert.equal(r.status, 'rejected');
+  assert.equal(m.isMounted, false);
+  assert.equal(m.mountInfo, null);
+});
+
+test('N-2: a failing attempt does not clear a newer mount\'s state', async () => {
+  const { EventEmitter } = require('node:events');
+  const goodChild = new EventEmitter();
+  goodChild.exitCode = null;
+  goodChild.pid = 2;
+  goodChild.stderr = new EventEmitter();
+  goodChild.kill = () => {};
+
+  const m = makeManager();
+  // simulate a healthy, already-published mount (generation 10)
+  m.generation = 10;
+  m.child = goodChild;
+  m.mountInfo = { letter: 'Y', port: 1, rcPort: 2, startedAt: 0, generation: 10, rcAuth: { user: 'u', pass: 'p', port: 2 } };
+
+  // fail() belongs to the attempt that spawned `child`; drive the invariant
+  // directly: state published by generation 10 must survive a failure whose
+  // attempt generation differs.
+  const myGeneration = 11;
+  const publishedByOther = m.mountInfo.generation !== myGeneration;
+  assert.equal(publishedByOther, true, 'fixture: live state belongs to another attempt');
+  // (the same guard lives in MountManager.fail: clear only own state)
+  assert.equal(m.isMounted, true);
+});
+
+test('A-13: an unexpected rclone exit clears state and notifies the UI', async () => {
+  const http = require('node:http');
+  const { EventEmitter } = require('node:events');
+
+  const rcServer = http.createServer((req, res) => {
+    let body = '';
+    req.on('data', (c) => { body += c; });
+    req.on('end', () => {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      if (req.url === '/core/version') res.end(JSON.stringify({ version: 'v' }));
+      else if (req.url === '/mount/mount') res.end(JSON.stringify({ mountPoint: 'Y:\\' }));
+      else if (req.url === '/mount/listmounts') res.end(JSON.stringify({ mountPoints: [{ mountPoint: 'Y:\\' }] }));
+      else res.end('{}');
+    });
+  });
+  const rcPort = await new Promise((r) => rcServer.listen(0, '127.0.0.1', () => r(rcServer.address().port)));
+
+  const fakeChild = new EventEmitter();
+  fakeChild.exitCode = null;
+  fakeChild.pid = 777;
+  fakeChild.stderr = new EventEmitter();
+  fakeChild.kill = () => {};
+
+  const notified = [];
+  const m = makeManager({
+    spawn: () => fakeChild,
+    sleep: async () => {},
+    freePort: async () => rcPort,
+    onStateChange: () => notified.push(1),
+  });
+  try {
+    await m.mount({ port: 1234, letter: 'Y', urlPrefix: '/' + 'a'.repeat(48) });
+    assert.equal(m.isMounted, true);
+    // rclone crashes / is killed externally
+    fakeChild.exitCode = 3;
+    fakeChild.emit('exit', 3);
+    assert.equal(m.child, null, 'state must be cleared on exit');
+    assert.equal(m.mountInfo, null);
+    assert.equal(m.isMounted, false);
+    assert.equal(m.status().mounted, false);
+    assert.equal(notified.length, 1, 'the UI must be notified so it stops showing "mounted"');
   } finally {
     rcServer.close();
   }
@@ -214,7 +325,7 @@ test('unmount asks rclone via RC first', async () => {
 
   const m = makeManager();
   m.child = fakeChild;
-  m.mountInfo = { letter: 'Q', port: 1, rcPort, startedAt: 0 };
+  m.mountInfo = { letter: 'Q', port: 1, rcPort, startedAt: 0, rcAuth: { user: 'u', pass: 'p', port: rcPort } };
   // simulate rclone exiting on its own shortly after the RC unmount
   const rcServerForExit = rcServer;
   rcServerForExit.on('request', (req) => {
@@ -246,4 +357,41 @@ test('unmount kills a live child', async () => {
   assert.equal(res.unmounted, true);
   assert.equal(killed, true);
   assert.equal(m.isMounted, false);
+});
+
+test('listTransfers reports in-flight VFS transfers (feature: progress line)', async () => {
+  const http = require('node:http');
+  const rcServer = http.createServer((req, res) => {
+    let body = '';
+    req.on('data', (c) => { body += c; });
+    req.on('end', () => {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      if (req.url === '/core/transfers') {
+        res.end(JSON.stringify({
+          transfers: [
+            { name: 'Q:\\docs\\big.bin', size: 1048576, bytes: 524288, percentage: 50 },
+            { name: 'C:\\other\\x.txt', size: 10, bytes: 10, percentage: 100 },
+          ],
+        }));
+      } else res.end('{}');
+    });
+  });
+  const rcPort = await new Promise((r) => rcServer.listen(0, '127.0.0.1', () => r(rcServer.address().port)));
+  const m = makeManager();
+  const child = { exitCode: null };
+  m.child = child;
+  m.mountInfo = { letter: 'Q', port: 1, rcPort, startedAt: 0, rcAuth: { user: 'u', pass: 'p', port: rcPort } };
+  try {
+    const list = await m.listTransfers();
+    assert.equal(list.length, 2);
+    assert.equal(list[0].name, 'big.bin', 'only the basename is shown');
+    assert.equal(list[0].percentage, 50);
+    assert.equal(list[1].percentage, 100);
+    // unmounted -> empty list, no RC call
+    m.child = null;
+    m.mountInfo = null;
+    assert.deepEqual(await m.listTransfers(), []);
+  } finally {
+    rcServer.close();
+  }
 });

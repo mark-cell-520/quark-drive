@@ -10,10 +10,11 @@
 
 - **扫码登录** — 桌面端展示二维码，夸克 APP 扫一扫即登录（无密码输入，令牌按机密处理）
 - **本地盘符挂载** — `Q:` 盘出现在文件资源管理器，支持浏览/读取/写入/新建文件夹/重命名/移动/删除
-- **一键安装** — 单个 `QuarkDrive Setup.exe`：自动安装 WinFsp 驱动、内置 rclone、装完即用
-- **大文件支持** — OSS 分片上传（服务端指定分片大小，1–64 MiB 钳制）+ 秒传（哈希命中）
-- **托盘常驻** — 最小化到托盘，支持开机自启、启动自动挂载
-- **安全默认** — 会话 Cookie 仅存本机 0600 文件、WebDAV 服务仅监听回路环口且带随机令牌、日志脱敏
+- **一键安装** — 单个 `QuarkDrive Setup.exe`：自动安装 WinFsp 驱动（带日志/重试/安装后验证）、内置 rclone、装完即用
+- **大文件支持** — OSS 分片上传（服务端指定分片大小，1–64 MiB 钳制）+ 秒传（哈希命中）+ 按 `part_thread` 并行分片
+- **传输进度** — 挂载中通过 rclone RC 实时显示正在传输的文件与百分比
+- **托盘常驻** — 最小化到托盘（菜单反映挂载状态）、支持开机自启、启动自动挂载、启动最小化
+- **安全默认** — 会话 Cookie 仅存本机 0600 文件、WebDAV 服务仅监听回路环口且带随机令牌、rclone RC 带每运行随机凭证、日志脱敏
 
 ## 安装（用户）
 
@@ -28,8 +29,9 @@
 资源管理器 → 此电脑 → Q:\    浏览 / 打开 / 复制粘贴 / 拖拽上传
 ```
 
-- 上传：把文件拖进 `Q:` 对应目录即可（大文件会分片上传）
+- 上传：把文件拖进 `Q:` 对应目录即可（大文件会分片上传，界面显示实时进度）
 - 卸载/挂载：托盘图标右键，或主界面按钮
+- 退出：主界面「退出应用」（先安全卸载，flush 待传队列）
 
 ## 开发者
 
@@ -43,25 +45,27 @@
 ```bash
 npm install                # 安装依赖
 npm run vendor             # 下载 rclone.exe + winfsp.msi（SHA256 校验）
-npm test                   # 158 项测试（node:test，零外部依赖）
+npm test                   # 191 项测试（node:test，零外部依赖；含稳定性 soak 套件）
 npm run smoke:mount        # 真机挂载冒烟（需要 WinFsp + rclone）
 npm start                  # 开发模式启动 Electron
 npm run dist               # 打包一键安装器
+node scripts/bench.js      # 性能基准（--quick / --json）
 ```
 
 ### 架构
 
 ```
 ┌──────────────────────── Electron 应用（app/）────────────────────────┐
-│  渲染层（登录二维码 / 容量 / 挂载控制 / 设置）  ← contextBridge 白名单桥  │
-│  主进程（托盘 / IPC / 生命周期）                                        │
+│  渲染层（登录二维码 / 容量 / 挂载控制 / 传输进度 / 设置）                │
+│    ← contextBridge 白名单桥                                           │
+│  主进程（托盘 / IPC / 生命周期 / 传输轮询）                             │
 └───────────────────────────────┬───────────────────────────────────────┘
                                 │ 进程内调用
 ┌───────────────────────────────▼───────────────────────────────────────┐
 │  纯 Node 核心（core/，零依赖）                                          │
-│    quark/   扫码登录 · 云盘 API · OSS 分片上传 · 纯 JS SHA1            │
+│    quark/   扫码登录 · 云盘 API · OSS 并行分片上传 · 纯 JS SHA1          │
 │    webdav/  自研 WebDAV 服务器（127.0.0.1 + 随机令牌 + Host 校验）      │
-│    mount/   rclone RC 生命周期（rcd + mount/mount + listmounts）       │
+│    mount/   rclone RC 生命周期（随机凭证 + rcd + mount + listmounts）   │
 └───────────────────────────────┬───────────────────────────────────────┘
                                 │ HTTP（PROPFIND/GET/PUT/MOVE/…）
                     rclone（vendor/rclone.exe）
@@ -69,14 +73,15 @@ npm run dist               # 打包一键安装器
                             本地盘符 Q:
 ```
 
-详细设计见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)，接口笔记见 [docs/API-NOTES.md](docs/API-NOTES.md)，安全模型见 [docs/SECURITY.md](docs/SECURITY.md)，安全审计报告见 [docs/AUDIT.md](docs/AUDIT.md)。
+详细设计见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)，接口笔记见 [docs/API-NOTES.md](docs/API-NOTES.md)，安全模型见 [docs/SECURITY.md](docs/SECURITY.md)，安全审计报告见 [docs/AUDIT.md](docs/AUDIT.md)，性能数据见 [docs/PERFORMANCE.md](docs/PERFORMANCE.md)。
 
 ## 测试与验证
 
-- `npm test` — 158 项单元/集成测试（含 mock Quark 后端的完整 WebDAV 协议套件）
+- `npm test` — 191 项单元/集成/稳定性测试（含 mock Quark 后端的完整 WebDAV 协议套件与并发/断连/畸形请求 soak 套件）
 - `npm run smoke:mount` — 真机挂载冒烟：rclone + WinFsp 挂载 `Q:` 后验证列表/读/写/建目录/优雅卸载
+- `node scripts/bench.js` — 性能基准（目录列表 / XML 构建 / SHA-1 / 上传管线 / WebDAV 端到端）
 - `npm run dist` 后 `node scripts/verify-package.js` — 校验 asar 打包内容
-- 已验证边界与未覆盖范围（真人扫码、沙箱 GUI 限制）见 [docs/AUDIT.md](docs/AUDIT.md) 第 5 节
+- 已验证边界与未覆盖范围（真人扫码、沙箱 GUI 与回环限制）见 [docs/AUDIT.md](docs/AUDIT.md) 与 [docs/VERIFICATION.md](docs/VERIFICATION.md)
 
 ## 目录结构
 
@@ -84,9 +89,9 @@ npm run dist               # 打包一键安装器
 quark-drive/
 ├── app/            Electron 外壳（main/preload/renderer）
 ├── core/           纯 Node 核心（零依赖，可独立 CLI 运行）
-├── tests/          node:test 测试（unit + integration + helpers）
-├── scripts/        fetch-vendor / make-icon / installer.nsh / 冒烟与校验脚本
-├── docs/           架构 / API 笔记 / 安全 / 审计报告
+├── tests/          node:test 测试（unit + integration + stability + helpers）
+├── scripts/        fetch-vendor / make-icon / installer.nsh / bench / 冒烟与校验脚本
+├── docs/           架构 / API 笔记 / 安全 / 审计报告 / 性能报告 / 验证记录
 └── vendor/         rclone.exe + winfsp.msi（构建时下载，不入库）
 ```
 

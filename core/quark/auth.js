@@ -79,11 +79,13 @@ class QrLogin {
 
   /**
    * Step 1+2: fetch a login token and build the QR URL.
+   * @param {{signal?: AbortSignal}} [opts]
    * @returns {Promise<{token: string, qrUrl: string, redactedUrl: string, expiresAt: number}>}
    */
-  async start() {
+  async start(opts = {}) {
     const out = await this.http.requestJson('GET', UOP_BASE + '/getTokenForQrcodeLogin', {
       query: this._baseParams(),
+      signal: opts.signal,
     });
     const token = out && out.data && out.data.members && out.data.members.token;
     if (!out || out.status !== ST_CONFIRMED || !token) {
@@ -116,12 +118,14 @@ class QrLogin {
 
   /**
    * Step 3: poll the scan status once.
+   * @param {{signal?: AbortSignal}} [opts]
    * @returns {Promise<{status: 'waiting'|'confirmed'|'expired', ticket?: string, rawStatus?: number, message?: string}>}
    */
-  async poll() {
+  async poll(opts = {}) {
     if (!this.pending) throw new Error('qr login: call start() first');
     const out = await this.http.requestJson('GET', UOP_BASE + '/getServiceTicketByQrcodeToken', {
       query: { ...this._baseParams(), token: this.pending.token },
+      signal: opts.signal,
     });
     const rawStatus = out && out.status;
     const ticket = out && out.data && out.data.members && out.data.members.service_ticket;
@@ -137,11 +141,14 @@ class QrLogin {
   /**
    * Step 4: exchange the service ticket for session cookies.
    * The response's Set-Cookie headers are ingested by the HttpClient jar.
+   * @param {string} ticket
+   * @param {{signal?: AbortSignal}} [opts]
    * @returns {Promise<{cookies: Record<string,string>, body: any}>}
    */
-  async complete(ticket) {
+  async complete(ticket, opts = {}) {
     const res = await this.http.request('GET', PAN_LOGIN_URL, {
       query: { st: ticket, fr: 'pc', pr: 'ucpro', mi: this.device.mi, ut: this.device.ut },
+      signal: opts.signal,
     });
     if (res.status >= 400) {
       throw new AuthError({ http: res.status, message: 'pan login http ' + res.status, url: PAN_LOGIN_URL });
@@ -179,21 +186,21 @@ class QrLogin {
     const timeoutMs = opts.timeoutMs || QR_TTL_MS;
     const sleep = opts.sleep || ((ms) => new Promise((r) => setTimeout(r, ms)));
 
-    const started = await this.start();
+    const started = await this.start({ signal: opts.signal });
     if (opts.onQr) opts.onQr(started);
 
     const deadline = Date.now() + timeoutMs;
     for (;;) {
       if (opts.signal && opts.signal.aborted) throw new Error('qr login aborted');
-      const poll = await this.poll();
+      const poll = await this.poll({ signal: opts.signal });
       if (poll.status === 'confirmed') {
         if (opts.onStatus) opts.onStatus('scan confirmed');
-        return this.complete(poll.ticket);
+        return this.complete(poll.ticket, { signal: opts.signal });
       }
       if (poll.status === 'expired') {
         // Refresh the code once and keep waiting (official client behaviour).
         if (opts.onStatus) opts.onStatus('qr expired, refreshing');
-        const refreshed = await this.start();
+        const refreshed = await this.start({ signal: opts.signal });
         if (opts.onQr) opts.onQr(refreshed);
       } else if (opts.onStatus) {
         opts.onStatus('waiting for scan');

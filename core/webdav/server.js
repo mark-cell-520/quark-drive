@@ -126,7 +126,7 @@ function createWebDavServer(opts) {
       if (!headOnly) {
         const children = (await fs.list(path)) || [];
         const links = children
-          .map((c) => '<li><a href="' + encodeURIComponent(c.name) + (c.isDir ? '/' : '') + '">' +
+          .map((c) => '<li><a href="./' + encodeURIComponent(c.name) + (c.isDir ? '/' : '') + '">' +
             escapeHtml(c.name) + '</a></li>')
           .join('');
         res.end('<!doctype html><meta charset="utf-8"><title>QuarkDrive</title><h1>QuarkDrive</h1><ul>' +
@@ -194,24 +194,36 @@ function createWebDavServer(opts) {
         // it first (rare path — rclone/Explorer always send content-length).
         const chunks = [];
         let buffered = 0;
+        let tooLarge = false;
         for await (const c of req) {
+          if (tooLarge) continue; // keep draining so the client can finish sending
           buffered += c.length;
           if (buffered > maxChunkedBodyBytes) {
-            // Answer first, then drop the connection — destroying the request
-            // before the response is flushed would break the client.
-            res.setHeader('Connection', 'close');
+            // Answer FIRST and then drain the rest of the body. Destroying
+            // the request/socket here (or setting Connection: close) makes
+            // the client see ECONNRESET instead of the 413 — it cannot tell
+            // "file too large" from "network failure" and may retry forever.
+            tooLarge = true;
             sendError(res, 413, 'chunked body too large (max ' + maxChunkedBodyBytes + ' bytes)');
-            setImmediate(() => req.destroy());
-            return;
+            continue;
           }
           chunks.push(c);
         }
+        if (tooLarge) return;
         const buf = Buffer.concat(chunks);
         out = await fs.writeFile(path, null, buf.length, { buffer: buf, mimeType });
       } else {
         out = await fs.writeFile(path, req, size, { mimeType });
       }
-      sendDavHeaders(res, { 'ETag': '"' + (out.fid || 'w') + '"' });
+      // Same ETag formula as stat/PROPFIND so caches see one identity per
+      // resource across verbs (a fresh stat re-lists the parent — the same
+      // listing the next PROPFIND would trigger anyway).
+      let etag = '"' + (out.fid || 'w') + '"';
+      try {
+        const st2 = await fs.stat(path);
+        if (st2) etag = st2.etag;
+      } catch (_e) { /* keep the fallback */ }
+      sendDavHeaders(res, { 'ETag': etag });
       res.writeHead(st ? 204 : 201);
       res.end();
     } catch (e) {

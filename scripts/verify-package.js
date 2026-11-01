@@ -10,9 +10,11 @@ console.log('total entries:', files.length);
 const must = [
   'app/main.js', 'app/preload.js',
   'app/renderer/index.html', 'app/renderer/app.js', 'app/renderer/styles.css',
-  'core/index.js', 'core/quark/auth.js', 'core/quark/api.js', 'core/quark/upload.js',
-  'core/webdav/server.js', 'core/webdav/quark-fs.js', 'core/mount/rclone.js',
-  'core/config.js', 'core/device.js', 'package.json',
+  'core/index.js', 'core/config.js', 'core/device.js',
+  'core/quark/auth.js', 'core/quark/api.js', 'core/quark/http.js', 'core/quark/upload.js', 'core/quark/sha1ctx.js',
+  'core/webdav/server.js', 'core/webdav/quark-fs.js', 'core/webdav/xml.js',
+  'core/mount/rclone.js',
+  'package.json',
 ];
 let missing = 0;
 for (const m of must) {

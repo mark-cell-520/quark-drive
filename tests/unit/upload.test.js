@@ -152,25 +152,30 @@ test('multi-part upload sends X-Oss-Hash-Ctx from part 2 with the right state', 
     parentFid: 'p1', fileName: 'big.bin', size: data.length, buffer: data,
   });
   assert.equal(out.rapid, false);
+  // parts may be PUT in any order (they upload concurrently) — index by partNumber
   const puts = http.events.filter((e) => e.kind === 'raw' && e.method === 'PUT');
   assert.equal(puts.length, 3);
   assert.equal(http.parts.length, 3);
-  assert.equal(http.parts[0].length + http.parts[1].length + http.parts[2].length, data.length);
-  assert.ok(!('X-Oss-Hash-Ctx' in puts[0].headers));
-  assert.ok('X-Oss-Hash-Ctx' in puts[1].headers);
-  assert.ok('X-Oss-Hash-Ctx' in puts[2].headers);
-  assert.match(puts[1].url, /partNumber=2/);
-  assert.match(puts[2].url, /partNumber=3/);
+  assert.equal(http.parts.reduce((n, p) => n + p.length, 0), data.length);
+  const byPart = new Map(puts.map((e) => [Number(/partNumber=(\d+)/.exec(e.url)[1]), e]));
+  assert.deepEqual([...byPart.keys()].sort(), [1, 2, 3]);
+  assert.ok(!('X-Oss-Hash-Ctx' in byPart.get(1).headers));
+  assert.ok('X-Oss-Hash-Ctx' in byPart.get(2).headers);
+  assert.ok('X-Oss-Hash-Ctx' in byPart.get(3).headers);
 
-  // ctx after part 1 must equal a fresh SHA-1 over the first partSize bytes
-  const ref = new Sha1Ctx();
-  ref.update(data.subarray(0, partSize));
-  assert.equal(puts[1].headers['X-Oss-Hash-Ctx'], ref.exportStateB64());
+  // ctx of part N must equal a fresh SHA-1 over parts 1..N-1
+  for (const n of [2, 3]) {
+    const ref = new Sha1Ctx();
+    ref.update(data.subarray(0, partSize * (n - 1)));
+    assert.equal(byPart.get(n).headers['X-Oss-Hash-Ctx'], ref.exportStateB64(), 'ctx of part ' + n);
+  }
 
   // auth_meta of part 2 embeds the same ctx
   const auth2 = http.events.filter((e) => e.kind === 'json' && e.url.includes('upload/auth'))[1];
   assert.match(auth2.body.auth_meta, /^PUT\n\napplication\/octet-stream\n.+\nX-Oss-Hash-Ctx:/);
-  assert.ok(auth2.body.auth_meta.includes(ref.exportStateB64()));
+  const ref2 = new Sha1Ctx();
+  ref2.update(data.subarray(0, partSize));
+  assert.ok(auth2.body.auth_meta.includes(ref2.exportStateB64()));
   assert.match(auth2.body.auth_meta, /\/bkt\/obj\/key\.txt\?partNumber=2&uploadId=uid-9$/);
 
   // commit lists 3 parts in order
@@ -178,7 +183,7 @@ test('multi-part upload sends X-Oss-Hash-Ctx from part 2 with the right state', 
   assert.match(commit.body.toString(), /<PartNumber>3<\/PartNumber><ETag>etag-3<\/ETag>/);
 });
 
-test('stream input is split by partSize', async () => {
+test('stream input is split by partSize (order-insensitive)', async () => {
   const http = fakeHttp();
   const data = crypto.randomBytes(2500 * 1024); // part_size 1MiB -> 3 parts
   await uploader(http).upload({
@@ -186,8 +191,12 @@ test('stream input is split by partSize', async () => {
   });
   const puts = http.events.filter((e) => e.kind === 'raw' && e.method === 'PUT');
   assert.equal(puts.length, 3);
-  assert.deepEqual(http.parts.map((p) => p.length), [1048576, 1048576, 462848]);
-  assert.equal(Buffer.concat(http.parts).equals(data), true);
+  // reassemble by part number: concurrent uploads may complete in any order
+  const byPart = puts
+    .map((e) => ({ n: Number(/partNumber=(\d+)/.exec(e.url)[1]), buf: Buffer.from(e.body) }))
+    .sort((a, b) => a.n - b.n);
+  assert.deepEqual(byPart.map((p) => p.buf.length), [1048576, 1048576, 462848]);
+  assert.equal(Buffer.concat(byPart.map((p) => p.buf)).equals(data), true);
 });
 
 test('rapid upload (秒传) skips commit', async () => {
@@ -227,11 +236,85 @@ test('onProgress reports monotonic progress', async () => {
     parentFid: '0', fileName: 'p.bin', size: 2500 * 1024, buffer: crypto.randomBytes(2500 * 1024),
     onProgress: (loaded, total) => seen.push([loaded, total]),
   });
-  assert.deepEqual(seen, [
-    [1048576, 2500 * 1024],
-    [2097152, 2500 * 1024],
-    [2500 * 1024, 2500 * 1024],
-  ]);
+  // parts upload concurrently, so only monotonicity + the final value are
+  // contractual (the completion order is not)
+  assert.equal(seen.length, 3);
+  for (let i = 1; i < seen.length; i++) {
+    assert.ok(seen[i][0] > seen[i - 1][0], 'loaded must strictly increase');
+  }
+  assert.deepEqual(seen[seen.length - 1], [2500 * 1024, 2500 * 1024]);
+});
+
+test('H3: parts upload concurrently up to the server part_thread', async () => {
+  const http = fakeHttp();
+  let inFlight = 0;
+  let maxInFlight = 0;
+  const realRequest = http.request.bind(http);
+  http.request = async (method, url, o = {}) => {
+    if (method !== 'PUT') return realRequest(method, url, o);
+    inFlight++;
+    maxInFlight = Math.max(maxInFlight, inFlight);
+    await new Promise((r) => setTimeout(r, 20)); // hold the part "on the wire"
+    try {
+      return await realRequest(method, url, o);
+    } finally {
+      inFlight--;
+    }
+  };
+  const partSize = 1024 * 1024;
+  const data = crypto.randomBytes(partSize * 6);
+  await uploader(http).upload({ parentFid: '0', fileName: 'par.bin', size: data.length, buffer: data });
+  assert.equal(maxInFlight, 3, 'part_thread=3 from the pre response must be honoured');
+  // and the ETag order in the commit still follows part numbers
+  const commit = http.events.filter((e) => e.kind === 'raw' && e.method === 'POST')[0];
+  const order = [...commit.body.toString().matchAll(/<PartNumber>(\d+)<\/PartNumber>/g)].map((m) => Number(m[1]));
+  assert.deepEqual(order, [1, 2, 3, 4, 5, 6]);
+});
+
+test('A-14: update/hash transport failure degrades to a normal commit', async () => {
+  const http = fakeHttp();
+  const real = http.requestJson.bind(http);
+  http.requestJson = async (method, url, o) => {
+    if (url.includes('update/hash')) throw new Error('network blip');
+    return real(method, url, o);
+  };
+  const out = await uploader(http).upload({
+    parentFid: '0', fileName: 'x.bin', size: 10, buffer: crypto.randomBytes(10),
+  });
+  assert.equal(out.rapid, false, 'must fall back to commit, not fail');
+  assert.ok(http.events.some((e) => e.kind === 'raw' && e.method === 'POST'), 'commit must run');
+});
+
+test('A-14: update/hash AuthError still fails the upload', async () => {
+  const http = fakeHttp();
+  const real = http.requestJson.bind(http);
+  const { AuthError } = require('../../core/quark/http.js');
+  http.requestJson = async (method, url, o) => {
+    if (url.includes('update/hash')) throw new AuthError({ code: '31001', message: 'session gone' });
+    return real(method, url, o);
+  };
+  await assert.rejects(
+    uploader(http).upload({ parentFid: '0', fileName: 'x.bin', size: 10, buffer: crypto.randomBytes(10) }),
+    /session gone/,
+  );
+});
+
+test('A-15: commit drops non-JSON callback payloads instead of base64-ing them', async () => {
+  const http = fakeHttp();
+  // callback 0 is not valid callback JSON: it must be dropped entirely
+  const real = http.requestJson.bind(http);
+  http.requestJson = async (method, url, o) => {
+    if (url.includes('upload/pre')) {
+      const res = await real(method, url, o);
+      res.data.callback = 0;
+      return res;
+    }
+    return real(method, url, o);
+  };
+  await uploader(http).upload({ parentFid: '0', fileName: 'x.bin', size: 10, buffer: crypto.randomBytes(10) });
+  const commit = http.events.filter((e) => e.kind === 'raw' && e.method === 'POST')[0];
+  assert.ok(!('x-oss-callback' in commit.headers) || commit.headers['x-oss-callback'] === '',
+    'a numeric callback must not be signed and sent');
 });
 
 test('pre failure raises UploadError', async () => {
