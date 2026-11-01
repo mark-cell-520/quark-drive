@@ -1,0 +1,10 @@
+{
+  "name": "quark-drive-core",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Quark Pan API client, WebDAV server and mount manager (pure Node.js, zero dependencies)",
+  "main": "index.js",
+  "scripts": {
+    "test": "node --test"
+  }
+}

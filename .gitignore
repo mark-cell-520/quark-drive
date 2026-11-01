@@ -1,0 +1,14 @@
+# dependencies
+node_modules/
+# build output
+dist/
+release/
+out/
+# vendored binaries (downloaded by scripts/fetch-vendor.mjs)
+vendor/
+# local session & logs (NEVER commit)
+*.session.json
+session.json
+*.log
+.DS_Store
+Thumbs.db

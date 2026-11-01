@@ -1,0 +1,66 @@
+{
+  "name": "quark-drive",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Quark Pan as a local Windows drive — mount Quark cloud storage as a drive letter with scan-code login and one-click install",
+  "license": "MIT",
+  "main": "app/main.js",
+  "scripts": {
+    "start": "electron .",
+    "dist": "electron-builder --win nsis",
+    "test": "node --test",
+    "vendor": "node scripts/fetch-vendor.mjs",
+    "icon": "node scripts/make-icon.js",
+    "smoke:mount": "node scripts/mount-smoke.js"
+  },
+  "dependencies": {
+    "qrcode": "^1.5.4"
+  },
+  "devDependencies": {
+    "electron": "^45.2.1",
+    "electron-builder": "^26.0.12"
+  },
+  "build": {
+    "appId": "com.quarkdrive.app",
+    "productName": "QuarkDrive",
+    "copyright": "MIT",
+    "compression": "maximum",
+    "files": [
+      "app/**/*",
+      "core/**/*",
+      "!core/**/*.test.js",
+      "!tests/**/*",
+      "scripts/make-icon.js"
+    ],
+    "extraResources": [
+      {
+        "from": "vendor/rclone.exe",
+        "to": "vendor/rclone.exe"
+      },
+      {
+        "from": "vendor/winfsp.msi",
+        "to": "vendor/winfsp.msi"
+      }
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "icon": "app/assets/icon.png"
+    },
+    "nsis": {
+      "oneClick": true,
+      "perMachine": true,
+      "allowToChangeInstallationDirectory": false,
+      "runAfterFinish": true,
+      "script": "scripts/nsis/quarkdrive.nsi",
+      "include": "scripts/installer.nsh",
+      "deleteAppDataOnUninstall": true
+    }
+  }
+}

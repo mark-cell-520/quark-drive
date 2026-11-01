@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>QuarkDrive</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header class="titlebar">
+    <div class="brand">
+      <span class="logo">Q</span>
+      <span>QuarkDrive</span>
+    </div>
+    <span class="subtitle">夸克网盘 · 本地硬盘</span>
+  </header>
+
+  <!-- ── login view ───────────────────────────────────────────── -->
+  <section id="view-login" class="view hidden">
+    <div class="card">
+      <h2>扫码登录</h2>
+      <p class="hint">请使用夸克 APP 扫描下方二维码登录</p>
+      <div id="qr-box" class="qr-box">
+        <img id="qr-img" alt="登录二维码" class="hidden">
+        <div id="qr-placeholder" class="qr-placeholder">二维码加载中…</div>
+      </div>
+      <p id="login-status" class="status">等待初始化…</p>
+      <div class="row">
+        <button id="btn-refresh-qr" class="btn secondary" type="button">刷新二维码</button>
+        <button id="btn-cancel-login" class="btn secondary" type="button">取消</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── main view ────────────────────────────────────────────── -->
+  <section id="view-main" class="view hidden">
+    <div class="card">
+      <div class="account">
+        <div>
+          <div id="account-name" class="account-name">—</div>
+          <div id="account-type" class="account-type">—</div>
+        </div>
+        <button id="btn-logout" class="btn secondary small" type="button">退出登录</button>
+      </div>
+      <div class="capacity">
+        <div class="capacity-labels">
+          <span id="cap-used">—</span>
+          <span id="cap-total">—</span>
+        </div>
+        <div class="capacity-bar"><div id="cap-fill" class="capacity-fill"></div></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>硬盘挂载</h2>
+      <div id="mount-state" class="mount-state">未挂载</div>
+      <div class="row">
+        <label for="sel-letter">盘符</label>
+        <select id="sel-letter"></select>
+        <button id="btn-mount" class="btn primary" type="button">挂载</button>
+        <button id="btn-unmount" class="btn danger hidden" type="button">卸载</button>
+      </div>
+      <p id="mount-hint" class="hint">挂载后可在文件资源管理器中像本地磁盘一样浏览夸克网盘。</p>
+    </div>
+
+    <div class="card">
+      <h2>设置</h2>
+      <label class="checkbox">
+        <input type="checkbox" id="chk-automount">
+        <span>启动时自动挂载</span>
+      </label>
+      <label class="checkbox">
+        <input type="checkbox" id="chk-autostart">
+        <span>开机自动启动（最小化到托盘）</span>
+      </label>
+      <div class="row">
+        <button id="btn-logs" class="btn secondary small" type="button">打开日志目录</button>
+        <span id="version" class="version"></span>
+      </div>
+    </div>
+  </section>
+
+  <div id="toast" class="toast hidden"></div>
+
+  <script src="app.js"></script>
+</body>
+</html>
