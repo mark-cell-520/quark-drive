@@ -45,7 +45,7 @@
 ```bash
 npm install                # 安装依赖
 npm run vendor             # 下载 rclone.exe + winfsp.msi（SHA256 校验）
-npm test                   # 191 项测试（node:test，零外部依赖；含稳定性 soak 套件）
+npm test                   # 195 项测试（node:test，零外部依赖；含稳定性 soak 套件）
 npm run smoke:mount        # 真机挂载冒烟（需要 WinFsp + rclone）
 npm start                  # 开发模式启动 Electron
 npm run dist               # 打包一键安装器
@@ -77,7 +77,7 @@ node scripts/bench.js      # 性能基准（--quick / --json）
 
 ## 测试与验证
 
-- `npm test` — 191 项单元/集成/稳定性测试（含 mock Quark 后端的完整 WebDAV 协议套件与并发/断连/畸形请求 soak 套件）
+- `npm test` — 195 项单元/集成/稳定性测试（含 mock Quark 后端的完整 WebDAV 协议套件与并发/断连/畸形请求 soak 套件）
 - `npm run smoke:mount` — 真机挂载冒烟：rclone + WinFsp 挂载 `Q:` 后验证列表/读/写/建目录/优雅卸载
 - `node scripts/bench.js` — 性能基准（目录列表 / XML 构建 / SHA-1 / 上传管线 / WebDAV 端到端）
 - `npm run dist` 后 `node scripts/verify-package.js` — 校验 asar 打包内容
