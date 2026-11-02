@@ -45,9 +45,12 @@
   ${If} $0 == ""
     DetailPrint "QuarkDrive: installing WinFsp (filesystem driver)..."
     ; the MSI is bundled as an extraResource next to the app; log the install
-    ; so a failed driver setup is diagnosable from %TEMP%
+    ; so a failed driver setup is diagnosable from %TEMP%.
+    ; REBOOT=ReallySuppress + MSIRESTARTMANAGERCONTROL=Disable keep the silent
+    ; install from ever surfacing a reboot prompt or stalling on the Restart
+    ; Manager (the classic "安装卡住" cause during one-click deploys).
     StrCpy $1 ""
-    nsExec::ExecToLog 'msiexec /qn /norestart /i "$INSTDIR\resources\vendor\winfsp.msi" /l*v "$TEMP\quarkdrive-winfsp-install.log"'
+    nsExec::ExecToLog 'msiexec /qn /norestart /i "$INSTDIR\resources\vendor\winfsp.msi" REBOOT=ReallySuppress MSIRESTARTMANAGERCONTROL=Disable /l*v "$TEMP\quarkdrive-winfsp-install.log"'
     Pop $1
     ${If} $1 == "0"
       DetailPrint "QuarkDrive: WinFsp installed."
@@ -63,7 +66,7 @@
       DetailPrint "QuarkDrive: WinFsp install returned $1 - retrying once..."
       Sleep 3000
       StrCpy $1 ""
-      nsExec::ExecToLog 'msiexec /qn /norestart /i "$INSTDIR\resources\vendor\winfsp.msi" /l*v "$TEMP\quarkdrive-winfsp-install.log"'
+      nsExec::ExecToLog 'msiexec /qn /norestart /i "$INSTDIR\resources\vendor\winfsp.msi" REBOOT=ReallySuppress MSIRESTARTMANAGERCONTROL=Disable /l*v "$TEMP\quarkdrive-winfsp-install.log"'
       Pop $1
       ${If} $1 == "0"
       ${OrIf} $1 == "1603"

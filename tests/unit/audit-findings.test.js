@@ -273,10 +273,144 @@ test('F-9: fetch-vendor.mjs pins SHA256 for every artifact and fails closed', ()
   assert.doesNotMatch(src, /sha256: null/);
 });
 
+// ------------------------------------------------------ round 3 (C series)
+
+/** Minimal fetch-like Response (same shape as http.test.js's res()). */
+function res(status, { headers = {}, body = '' } = {}) {
+  const h = new Map(Object.entries(headers).map(([k, v]) => [k.toLowerCase(), v]));
+  return {
+    status,
+    headers: {
+      get: (k) => h.get(String(k).toLowerCase()) ?? null,
+      getSetCookie: () => (h.has('set-cookie') ? [h.get('set-cookie')] : []),
+    },
+    arrayBuffer: async () => Buffer.from(body),
+    text: async () => body,
+  };
+}
+
+// ---------------------------------------------------------------- C-1: SSRF guard
+
+test('C-1: plaintext http request URLs are refused (TLS downgrade)', async () => {
+  const seen = [];
+  const http = new HttpClient({
+    fetchImpl: async (url) => { seen.push(url); return res(200, { headers: { 'content-type': 'application/json' }, body: '{}' }); },
+  });
+  await assert.rejects(http.requestJson('GET', 'http://drive-pc.quark.cn/x'), /https required/);
+  assert.equal(seen.length, 0, 'no request may leave the process');
+});
+
+test('C-1: IP-literal and internal hosts are refused (loopback/metadata SSRF)', async () => {
+  const http = new HttpClient({ fetchImpl: async () => res(200, { body: '{}' }) });
+  for (const u of [
+    'https://127.0.0.1/x',
+    'https://169.254.169.254/latest/meta-data/',
+    'https://[::1]/x',
+    'https://10.0.0.5/x',
+    'https://localhost/x',
+    'https://svc.internal/x',
+    // FQDN-root-dot spellings resolve to the same internal targets
+    'https://127.0.0.1./x',
+    'https://localhost./x',
+  ]) {
+    await assert.rejects(http.requestJson('GET', u), /refusing to fetch/, u);
+  }
+});
+
+test('C-1: a redirect to an internal host or plaintext is refused', async () => {
+  const http = new HttpClient({
+    fetchImpl: async () => res(302, { headers: { location: 'http://169.254.169.254/latest/meta-data/' } }),
+  });
+  await assert.rejects(http.request('GET', 'https://drive-pc.quark.cn/1/clouddrive/file/download', { raw: true }), /refusing to fetch/);
+});
+
+test('C-1: ordinary public https destinations are still allowed', async () => {
+  const seen = [];
+  const http = new HttpClient({
+    fetchImpl: async (url) => { seen.push(url); return res(200, { headers: { 'content-type': 'application/json' }, body: '{"ok":1}' }); },
+  });
+  await http.requestJson('GET', 'https://drive-pc.quark.cn/1/clouddrive/member');
+  await http.requestJson('GET', 'https://dn-quark-cdn.example.com/f');
+  assert.equal(seen.length, 2);
+});
+
+// ---------------------------------------------------------------- C-2: body cap
+
+test('C-2: an oversized buffered response is aborted, not materialised', async () => {
+  const big = Buffer.alloc(4096, 0x61);
+  const http = new HttpClient({
+    fetchImpl: async () => new Response(new Blob([big]).stream(), {
+      status: 200, headers: { 'content-type': 'application/json', 'content-length': '10' },
+    }),
+    maxBodyBytes: 1024,
+  });
+  await assert.rejects(http.requestJson('GET', 'https://drive-pc.quark.cn/x'), /exceeds 1024 bytes/);
+});
+
+test('C-2: normal-sized responses are unaffected by the cap', async () => {
+  const http = new HttpClient({
+    fetchImpl: async () => res(200, { headers: { 'content-type': 'application/json' }, body: '{"code":0,"data":{"a":1}}' }),
+    maxBodyBytes: 1024,
+  });
+  const out = await http.requestJson('GET', 'https://drive-pc.quark.cn/x');
+  assert.deepEqual(out, { code: 0, data: { a: 1 } });
+});
+
+// ---------------------------------------------------------------- C-3: CSPRNG request_id
+
+test('C-3: the login request_id nonce is CSPRNG-sourced (no Math.random)', () => {
+  const src = fs.readFileSync(path.join(__dirname, '..', '..', 'core', 'quark', 'auth.js'), 'utf8');
+  // strip comments so prose mentioning the old PRNG cannot false-positive
+  const code = src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:"'`])\/\/.*$/gm, '$1');
+  assert.doesNotMatch(code, /Math\.random/, 'request_id must not come from the non-crypto PRNG');
+  assert.match(code, /crypto\.randomInt/, 'request_id must use crypto.randomInt');
+});
+
+// ---------------------------------------------------------------- C-4: cookie redaction
+
+test('C-4: rotated cookie values AND individual pairs are redacted from logs', () => {
+  const { buildStack } = require('../../core/index.js');
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), 'quarkdrive-c4-'));
+  fs.writeFileSync(path.join(base, 'session.json'),
+    JSON.stringify({ cookies: { __puus: 'oldsecretvalue111', __pus: 'oldpusvalue222' } }), { mode: 0o600 });
+  const stack = buildStack({ baseDir: base, quiet: true });
+  // the jar rotates during API calls (Set-Cookie) — a fresh value appears
+  stack.http.cookieJar.ingest(['__puus=newrotatedsecret333; Path=/']);
+  stack.logger.info('pair leak __puus=newrotatedsecret333 and __pus=oldpusvalue222');
+  stack.logger.warn('header leak ' + stack.http.cookieJar.header());
+  const log = fs.readFileSync(path.join(base, 'logs', 'quark-drive.log'), 'utf8');
+  assert.doesNotMatch(log, /newrotatedsecret333/, 'rotated value must be redacted');
+  assert.doesNotMatch(log, /oldpusvalue222/, 'individual pair must be redacted');
+  assert.doesNotMatch(log, /oldsecretvalue111/, 'old value must stay redacted');
+  assert.match(log, /<redacted>/);
+});
+
+// ------------------------------------------------------ M-1: build-time vendor gate
+
+test('M-1: the build gates on vendor integrity and fails closed on a tampered binary', () => {
+  const { spawnSync } = require('node:child_process');
+  const gate = path.join(__dirname, '..', '..', 'scripts', 'verify-vendor.js');
+  const src = fs.readFileSync(gate, 'utf8');
+  assert.match(src, /fetch-vendor\.mjs/, 'pins must be read from the fetcher (single source of truth)');
+  const pkg = JSON.parse(fs.readFileSync(path.join(__dirname, '..', '..', 'package.json'), 'utf8'));
+  assert.equal(pkg.scripts.predist, 'node scripts/verify-vendor.js', 'npm run dist must gate on vendor integrity');
+  assert.equal(pkg.build.beforePack, 'scripts/verify-vendor.js', 'electron-builder must gate on vendor integrity');
+  // functional: a substituted binary in a vendor dir must fail the gate
+  const vdir = fs.mkdtempSync(path.join(os.tmpdir(), 'quarkdrive-vendor-'));
+  fs.writeFileSync(path.join(vdir, 'rclone.exe'), 'not the real binary');
+  const bad = spawnSync(process.execPath, [gate, vdir], { encoding: 'utf8' });
+  assert.equal(bad.status, 1, 'a tampered rclone.exe must fail the gate');
+  assert.match(bad.stderr, /FAIL\s+rclone\.exe/);
+  // ...and the real vendored binaries (when present) must pass
+  if (fs.existsSync(path.join(__dirname, '..', '..', 'vendor', 'rclone.exe'))) {
+    const good = spawnSync(process.execPath, [gate], { encoding: 'utf8' });
+    assert.equal(good.status, 0, 'the real vendor binaries must pass the gate');
+  }
+});
+
 // ------------------------------------------------------------------ helpers
 
-function makeFs() {
-  const tree = {
+function makeFs() {  const tree = {
     '0': [
       { fid: 'd1', file_name: 'docs', dir: 1, file_type: 0, size: 0, updated_at: 100, created_at: 90 },
       { fid: 'f1', file_name: 'a.txt', dir: 0, file_type: 4, size: 11, updated_at: 200, created_at: 90 },

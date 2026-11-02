@@ -82,6 +82,16 @@ select {
   padding: 6px 8px; font-size: 13px;
 }
 
+input[type="text"] {
+  background: #0a0c10; color: var(--text);
+  border: 1px solid var(--card-border); border-radius: 6px;
+  padding: 6px 8px; font-size: 13px; width: 150px;
+}
+input[type="text"]::placeholder { color: #5b6472; }
+
+.cache-block { display: flex; flex-direction: column; gap: 8px; margin-top: 12px; }
+.cache-status { color: var(--ok); font-size: 12px; }
+
 .btn {
   border: none; border-radius: 6px; cursor: pointer;
   padding: 7px 14px; font-size: 13px; color: #fff;

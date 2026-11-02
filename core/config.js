@@ -60,12 +60,15 @@ class ConfigStore {
       sessionFile: path.join(this.baseDir, 'session.json'),
       settingsFile: path.join(this.baseDir, 'settings.json'),
       logDir: path.join(this.baseDir, 'logs'),
+      // rclone VFS on-disk cache home (bounded by mountOptions.vfsCacheMaxSize)
+      cacheDir: path.join(this.baseDir, 'vfs-cache'),
     };
   }
 
   ensureDirs() {
     fs.mkdirSync(this.baseDir, { recursive: true });
     fs.mkdirSync(this.paths.logDir, { recursive: true });
+    fs.mkdirSync(this.paths.cacheDir, { recursive: true });
   }
 
   _readJson(file) {
@@ -156,4 +159,76 @@ function deepMerge(base, patch) {
   return out;
 }
 
-module.exports = { ConfigStore, DEFAULT_SETTINGS, defaultBaseDir, isInside, deepMerge };
+// --------------------------------------------------------- mount option guards
+//
+// The renderer is untrusted UI, so any settings value it sends must be
+// validated before it reaches rclone's command line. These guards are the
+// single source of truth for what the renderer is allowed to tune; unknown
+// keys are dropped (never forwarded), bad values are rejected.
+
+/** rclone size: optional number with optional K/M/G/T(/P) suffix, or "off". */
+const RCLONE_SIZE_RE = /^(\d+(?:\.\d+)?)\s*([kmgtp]i?b?)?$/i;
+const SIZE_FACTORS = { '': 1, k: 1024, m: 1024 ** 2, g: 1024 ** 3, t: 1024 ** 4, p: 1024 ** 5 };
+/** 1 PiB sanity ceiling — rejects typos like "999999999G" that would overflow. */
+const MAX_CACHE_BYTES = 1024 * 1024 ** 4;
+const CACHE_MODES = ['off', 'minimal', 'writes', 'full'];
+
+/**
+ * Validate + canonicalise an rclone size string ("10G", "500M", "off", bytes).
+ * @returns {string|null} canonical form ("10G" / "off" / "<bytes>") or null.
+ *   Empty means "unset" (null); 0 and garbage are invalid (null).
+ */
+function normalizeRcloneSize(v) {
+  const s = String(v == null ? '' : v).trim();
+  if (s === '') return null;
+  if (/^off$/i.test(s)) return 'off';
+  const m = RCLONE_SIZE_RE.exec(s);
+  if (!m) return null;
+  const num = Number(m[1]);
+  if (!Number.isFinite(num) || num <= 0) return null;
+  const unit = (m[2] || '').toLowerCase().replace(/i?b?$/, '');
+  const factor = SIZE_FACTORS[unit];
+  if (factor === undefined) return null;
+  const bytes = num * factor;
+  if (bytes > MAX_CACHE_BYTES) return null;
+  if (unit === '') {
+    if (!Number.isInteger(bytes)) return null; // bare bytes must be whole
+    return String(bytes);
+  }
+  return String(num) + unit.toUpperCase();
+}
+
+/** Validate an rclone --vfs-cache-mode value. @returns {string|null} */
+function validateCacheMode(v) {
+  const s = String(v == null ? '' : v).trim().toLowerCase();
+  return CACHE_MODES.includes(s) ? s : null;
+}
+
+/** mountOptions keys the (untrusted) renderer may change, each with a validator. */
+const RENDERER_MOUNT_OPTIONS = {
+  vfsCacheMaxSize: normalizeRcloneSize,
+  vfsCacheMode: validateCacheMode,
+};
+
+/**
+ * Sanitise a renderer-supplied mountOptions patch: keep only the cache keys
+ * above, validate each value. Unknown keys are ignored (never forwarded to
+ * rclone); an invalid value for a known key is an error the caller surfaces.
+ * @returns {{ok: true, cleaned: object} | {ok: false, error: string}}
+ */
+function sanitizeRendererMountOptions(patch) {
+  const cleaned = {};
+  for (const [k, v] of Object.entries(patch || {})) {
+    const validator = RENDERER_MOUNT_OPTIONS[k];
+    if (!validator) continue; // not renderer-settable — silently dropped
+    const nv = validator(v);
+    if (nv == null) return { ok: false, error: 'invalid value for ' + k };
+    cleaned[k] = nv;
+  }
+  return { ok: true, cleaned };
+}
+
+module.exports = {
+  ConfigStore, DEFAULT_SETTINGS, defaultBaseDir, isInside, deepMerge,
+  normalizeRcloneSize, validateCacheMode, sanitizeRendererMountOptions, RENDERER_MOUNT_OPTIONS,
+};

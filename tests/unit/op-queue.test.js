@@ -69,3 +69,26 @@ test('nested serialize still excludes OUTSIDE operations', async () => {
   await Promise.all([outer, outside]);
   assert.equal(maxInFlight, 1, 'the nested call must not break mutual exclusion');
 });
+
+test('an operation submitted WHILE one is in flight must queue, not run inline (Q-1)', async () => {
+  const { serialize } = createOpQueue();
+  let inFlight = 0;
+  let maxInFlight = 0;
+  const order = [];
+  const op = (id, ms) => serialize(async () => {
+    inFlight++;
+    maxInFlight = Math.max(maxInFlight, inFlight);
+    await new Promise((r) => setTimeout(r, ms));
+    order.push(id);
+    inFlight--;
+  });
+  // A is started and already awaiting when B is submitted from an unrelated
+  // task (e.g. a second tray click during a mount). B is NOT nested inside A,
+  // so it must wait for A — an in-flight counter would misread this as nested
+  // and run both at once (two rclone spawns / lost mount state).
+  op('A', 40);
+  await new Promise((r) => setTimeout(r, 10));
+  await op('B', 5);
+  assert.equal(maxInFlight, 1, 'independent operations must never overlap');
+  assert.deepEqual(order, ['A', 'B']);
+});

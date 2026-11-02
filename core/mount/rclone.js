@@ -15,9 +15,11 @@
  * electron.exe, which cannot run node scripts.
  *
  * Hardening:
- *  - the RC endpoint is protected by per-run random credentials (Basic auth);
- *    without them any local process — or a browser page via a CORS simple
- *    request — could enumerate the filesystem or (un)mount drives.
+ *  - the RC endpoint is protected by per-run random credentials (Basic auth)
+ *    passed via the child's environment (argv is readable by same-user
+ *    processes); without them any local process — or a browser page via a
+ *    CORS simple request — could enumerate the filesystem or (un)mount
+ *    drives.
  *  - mount/unmount are serialized by in-flight locks, and a failing attempt
  *    only clears state it owns (generation token), so a concurrent or failed
  *    mount can never orphan an rclone process holding the drive letter.
@@ -196,11 +198,15 @@ class MountManager {
     const creds = randomCreds();
 
     // `rclone rcd` = the remote-control daemon (no filesystem side effects).
+    // RC credentials are passed through the child's ENVIRONMENT, never argv:
+    // argv is readable by any same-user process (Win32_Process.CommandLine),
+    // which would hand out the very per-run credentials N-1 introduced
+    // (audit finding M-3). rclone reads RCLONE_RC_USER/RCLONE_RC_PASS from
+    // the environment (verified against the vendored binary: its log shows
+    // "Using --user … --pass XXXX").
     const args = [
       'rcd',
       '--rc-addr', '127.0.0.1:' + rcPort,
-      '--rc-user', creds.user,
-      '--rc-pass', creds.pass,
       // parallel part uploads / multi-file copies through the VFS
       '--transfers', '8',
       '--log-level', 'INFO',
@@ -212,6 +218,7 @@ class MountManager {
     const child = this.spawn(rclone, args, {
       windowsHide: true,
       stdio: ['ignore', 'ignore', 'pipe'],
+      env: { ...process.env, RCLONE_RC_USER: creds.user, RCLONE_RC_PASS: creds.pass },
     });
 
     /** RC credentials live with this attempt (closure), never on the instance. */

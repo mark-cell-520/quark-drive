@@ -73,6 +73,15 @@ OSS 多分片协议要求 `X-Oss-Hash-Ctx`（SHA-1 内部状态），Node crypto
 | `--transfers` | `8` | 多文件拷贝进 Q: 的并行度 |
 | webdav `timeout` | `30m` | 与服务端下载看门狗对齐（默认 5m 会误杀慢链路） |
 
+其中 **`--vfs-cache-max-size`（缓存大小）与 `--vfs-cache-mode`（缓存模式）开放给用户在设置里手动调整**：
+下拉预设 512M–50G / 不限，或输入自定义值（如 `12G`）。渲染层传来的值经
+`sanitizeRendererMountOptions` 严格校验（`normalizeRcloneSize` / `validateCacheMode`）后才进入 rclone
+命令行——未知键一律丢弃，非法值直接报错，`rclonePath` 等危险键渲染层永远碰不到。
+
+VFS 磁盘缓存固定落在 `%LOCALAPPDATA%\QuarkDrive\vfs-cache`（`config.paths.cacheDir`，构建栈时自动创建），
+设置页「清理缓存」可在**卸载后**清空该目录（`isInside` 路径防护 + 挂载中禁用，防止误删 rclone 正在写的文件）。
+修改缓存大小/模式后**重新挂载生效**（界面会提示）。
+
 ### 6. 下载 URL 缓存（quark-fs.js）
 预签名 CDN URL 按 fid 缓存 5 分钟（256 条 LRU）：Explorer 预览、rclone 读前移
 重复打开不再每次打 API。CDN 返回 403/404 时淘汰并重取一次。

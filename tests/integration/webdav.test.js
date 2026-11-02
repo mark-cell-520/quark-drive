@@ -43,10 +43,15 @@ async function dav(method, path, { headers = {}, body = null } = {}) {
 test('OPTIONS advertises DAV and the allowed methods', async () => {
   const r = await dav('OPTIONS', '/');
   assert.equal(r.status, 200);
-  assert.match(r.headers.get('dav') || '', /1, 2/);
-  for (const m of ['PROPFIND', 'GET', 'PUT', 'DELETE', 'MKCOL', 'MOVE']) {
+  // class 1 only: LOCK/UNLOCK are not implemented, so class 2 must not be
+  // advertised (audit finding W-4)
+  assert.equal(r.headers.get('dav'), '1');
+  for (const m of ['PROPFIND', 'GET', 'HEAD', 'PUT', 'DELETE', 'MKCOL', 'MOVE']) {
     assert.match(r.headers.get('allow') || '', new RegExp(m));
   }
+  // verbs we do NOT implement must not be advertised either
+  assert.doesNotMatch(r.headers.get('allow') || '', /\bPOST\b/);
+  assert.doesNotMatch(r.headers.get('allow') || '', /\bCOPY\b/);
 });
 
 test('PROPFIND depth 0 on / returns the root collection', async () => {
@@ -228,6 +233,79 @@ test('raw un-normalized traversal requests stay inside the namespace', async () 
 test('unknown method is 405', async () => {
   const r = await dav('COPY', '/docs/a.txt');
   assert.equal(r.status, 405);
+});
+
+// ------------------------------------------------- round 3 (W series)
+
+test('W-1/W-2: Host guard rejects userinfo tricks and accepts bracketed IPv6', async () => {
+  // fetch cannot override the Host header (forbidden header name) — raw socket
+  const net = require('node:net');
+  const port = Number(base.split(':')[2].split('/')[0]);
+  const sendRawHost = (host) => new Promise((resolve, reject) => {
+    const sock = net.connect(port, '127.0.0.1', () => {
+      sock.write('PROPFIND /' + server.authToken + '/ HTTP/1.1\r\nHost: ' + host +
+        '\r\nDepth: 0\r\nConnection: close\r\n\r\n');
+    });
+    let data = '';
+    sock.on('data', (d) => { data += d.toString(); });
+    sock.on('end', () => resolve(Number(/^HTTP\/1\.1 (\d+)/.exec(data)[1])));
+    sock.on('error', reject);
+  });
+  // "@" userinfo form must NOT pass as loopback (it used to: split(':')[0])
+  assert.equal(await sendRawHost('127.0.0.1:80@evil.com'), 421);
+  // foreign hosts, subdomains and trailing dots stay rejected
+  for (const host of ['evil.example.com', 'localhost.evil.com', '127.0.0.1.evil.com', '127.0.0.1.', 'localhost.']) {
+    assert.equal(await sendRawHost(host), 421, host);
+  }
+  // ordinary loopback forms still work (incl. the IPv6 spelling, which the
+  // old split(':')[0] logic could never match)
+  for (const host of ['127.0.0.1', '127.0.0.1:9798', 'localhost', 'localhost:9798', '[::1]', '[::1]:9798']) {
+    assert.equal(await sendRawHost(host), 207, host);
+  }
+});
+
+test('W-3: HEAD is answered from metadata without opening the upstream', async () => {
+  // the fake download URL is http://127.0.0.1:1/fake/<fid> (unreachable): if
+  // HEAD still opened the stream it would fail/hang — it must answer from stat
+  const r = await dav('HEAD', '/docs/a.txt');
+  assert.equal(r.status, 200);
+  assert.equal(r.text, '');
+  assert.equal(r.headers.get('content-length'), '11');
+  assert.equal(r.headers.get('content-type'), 'text/plain');
+  // HEAD + Range reports the range from metadata
+  const r2 = await dav('HEAD', '/docs/a.txt', { headers: { Range: 'bytes=6-' } });
+  assert.equal(r2.status, 206);
+  assert.equal(r2.headers.get('content-length'), '5');
+  assert.equal(r2.headers.get('content-range'), 'bytes 6-10/11');
+});
+
+test('W-6: a hostile upstream Content-Type falls back to octet-stream', async () => {
+  const fsLayer = new QuarkFs({
+    api: quark,
+    uploader: new FakeUploader(quark),
+    http: {
+      cookieJar: { header: () => '' },
+      async request() {
+        return {
+          status: 200,
+          headers: { get: (k) => ({ 'content-type': 'text/plain\r\nX-Injected: yes', 'content-length': '11' }[String(k).toLowerCase()] || null) },
+          response: { body: require('node:stream').Readable.toWeb(require('node:stream').Readable.from([Buffer.from('hello world')])) },
+          body: null,
+        };
+      },
+    },
+  });
+  const srv = createWebDavServer({ fs: fsLayer, host: '127.0.0.1', port: 0, logger: { debug() {}, warn() {}, error() {} } });
+  const port = await srv.listenAsync(0);
+  try {
+    const res = await fetch('http://127.0.0.1:' + port + srv.urlPrefix + '/docs/a.txt');
+    assert.equal(res.status, 200, 'a hostile mime must not 500 the request');
+    assert.equal(res.headers.get('x-injected'), null, 'no header injection');
+    assert.equal(res.headers.get('content-type'), 'application/octet-stream');
+    assert.equal(await res.text(), 'hello world');
+  } finally {
+    await srv.closeAsync();
+  }
 });
 
 test('PROPPATCH is accepted (207)', async () => {

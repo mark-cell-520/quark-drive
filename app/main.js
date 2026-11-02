@@ -18,6 +18,7 @@ const { app, BrowserWindow, Tray, Menu, ipcMain, shell } = require('electron');
 
 const core = require('../core/index.js');
 const { createWebDavServer } = require('../core/webdav/server.js');
+const { sanitizeRendererMountOptions, isInside } = require('../core/config.js');
 const { createOpQueue } = require('./op-queue.js');
 
 const isPackaged = app.isPackaged;
@@ -209,7 +210,9 @@ async function startServer() {
     const srv = createWebDavServer({ fs: stack.fs, host: '127.0.0.1', port: settings.webdavPort, logger: stack.logger });
     const port = await srv.listenAsync(settings.webdavPort);
     server = srv; // publish only after the listen succeeded
-    stack.logger.info('webdav listening on 127.0.0.1:' + port + srv.urlPrefix);
+    // NOTE: the URL prefix is this run's secret token — never write it to the
+    // log file (audit finding M-3: logs are readable by same-user processes).
+    stack.logger.info('webdav listening on 127.0.0.1:' + port);
     return { port, urlPrefix: srv.urlPrefix };
   });
 }
@@ -320,6 +323,10 @@ function createWindow({ show = true } = {}) {
     },
   });
   mainWindow.loadFile(path.join(__dirname, 'renderer', 'index.html'));
+  // Defence in depth (audit round 3): the window loads exactly one local
+  // file and never navigates or opens popups.
+  mainWindow.webContents.on('will-navigate', (e) => e.preventDefault());
+  mainWindow.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
   mainWindow.on('close', (e) => {
     // Minimize to tray instead of quitting.
     if (!app.isQuitting) {
@@ -371,6 +378,9 @@ function registerIpc() {
   ipcMain.handle('settings:set', async (_e, patch) => {
     const clean = {};
     for (const [k, v] of Object.entries(patch || {})) {
+      // an explicit undefined must not ERASE a stored key (round-3 LOW:
+      // {startWithWindows: undefined} used to drop it back to the default)
+      if (v === undefined) continue;
       if (SETTINGS_WHITELIST.has(k)) clean[k] = v;
     }
     if (clean.driveLetter != null) {
@@ -383,10 +393,23 @@ function registerIpc() {
       const p = Number(clean.webdavPort);
       if (!Number.isInteger(p) || p < 1024 || p > 65535) throw new Error('invalid port');
     }
+    // mountOptions: the renderer may tune only the cache keys, each strictly
+    // validated (unknown keys dropped, bad values rejected). The rest of
+    // mountOptions (bufferSize, dirCacheTime, …) is preserved untouched.
+    if (patch && patch.mountOptions && typeof patch.mountOptions === 'object' && !Array.isArray(patch.mountOptions)) {
+      const res = sanitizeRendererMountOptions(patch.mountOptions);
+      if (!res.ok) throw new Error(res.error);
+      if (Object.keys(res.cleaned).length > 0) {
+        clean.mountOptions = { ...(stack.settings.mountOptions || {}), ...res.cleaned };
+      }
+    }
     const next = { ...stack.settings, ...clean };
     stack.config.saveSettings(next);
     stack.settings = next;
+    // MountManager reads these at mount time from its OWN settings reference;
+    // stack.settings was reassigned above, so re-sync the live fields.
     if (clean.driveLetter) stack.mount.settings.driveLetter = clean.driveLetter;
+    if (clean.mountOptions) stack.mount.settings.mountOptions = next.mountOptions;
     if (clean.startWithWindows !== undefined) {
       app.setLoginItemSettings({ openAtLogin: !!clean.startWithWindows, args: [] });
     }
@@ -402,6 +425,27 @@ function registerIpc() {
     if (!st.mounted || !st.letter) return { opened: false };
     const err = await shell.openPath(st.letter + ':\\');
     return { opened: !err, error: err || null };
+  });
+  ipcMain.handle('app:clearCache', async () => {
+    // Only safe while nothing is mounted — rclone holds cache file handles.
+    if (stack.mount.isMounted) {
+      return { cleared: false, error: '请先卸载盘符，再清理缓存' };
+    }
+    const dir = (stack.settings.mountOptions || {}).cacheDir;
+    if (!dir) return { cleared: false, error: '未配置缓存目录' };
+    // Defence in depth: only ever clear inside the app's own data directory,
+    // never an arbitrary path a compromised renderer might request.
+    if (!isInside(stack.config.baseDir, dir)) {
+      return { cleared: false, error: '缓存目录不在应用数据目录内，已阻止' };
+    }
+    try {
+      fs.rmSync(dir, { recursive: true, force: true });
+      fs.mkdirSync(dir, { recursive: true });
+      stack.logger.info('vfs cache cleared: ' + dir);
+      return { cleared: true };
+    } catch (e) {
+      return { cleared: false, error: e.message };
+    }
   });
   ipcMain.handle('app:quit', async () => {
     // Graceful quit: flush the VFS (unmount) before exiting, exactly like

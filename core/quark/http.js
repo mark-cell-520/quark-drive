@@ -12,6 +12,8 @@
  * Zero dependencies; `fetchImpl` is injectable for tests.
  */
 
+const net = require('node:net');
+
 /** Business/transport-level "session is no longer valid" error. */
 class AuthError extends Error {
   /**
@@ -107,11 +109,76 @@ class CookieJar {
 }
 
 const DEFAULT_TIMEOUT_MS = 30000;
+/**
+ * Max bytes buffered for a non-streaming response (audit finding C-2).
+ * API/JSON responses are orders of magnitude smaller; anything larger is a
+ * broken or hostile upstream and must not be materialised in memory.
+ */
+const MAX_BODY_BYTES = 64 * 1024 * 1024;
+
+/**
+ * SSRF guard (audit finding C-1): every URL this client fetches — the initial
+ * one and every redirect hop — must be an ordinary public https endpoint.
+ *
+ * download_url / upload_url / Location all originate from server responses;
+ * without this check a tampered upstream could point the client at loopback,
+ * link-local (cloud metadata) or internal services, or downgrade to plaintext
+ * http. Legitimate Quark API/CDN/OSS hosts are public DNS names, so the
+ * restrictions below cannot reject a real destination.
+ */
+function assertFetchableUrl(url, what) {
+  if (url.protocol !== 'https:') {
+    throw new Error('refusing to fetch ' + what + ' over ' + url.protocol + ' (https required): ' + url.host);
+  }
+  if (url.username || url.password) {
+    throw new Error('refusing to fetch ' + what + ' with embedded credentials: ' + url.host);
+  }
+  // normalise away the FQDN root dot ("127.0.0.1." resolves to loopback)
+  const host = url.hostname.toLowerCase().replace(/\.$/, '');
+  // IP literals (v4/v6, dotted or bracketed) have no business being an API-
+  // supplied destination — real CDN/OSS endpoints are DNS names.
+  if (net.isIP(host.replace(/^\[|]$/g, '')) !== 0) {
+    throw new Error('refusing to fetch ' + what + ' at IP literal ' + host);
+  }
+  if (host === 'localhost' || host.endsWith('.localhost') ||
+      host.endsWith('.local') || host.endsWith('.internal') || host.endsWith('.home.arpa')) {
+    throw new Error('refusing to fetch ' + what + ' at internal host ' + host);
+  }
+}
+
+/** Read a response body into a Buffer, aborting past maxBytes. */
+async function readCappedBody(res, maxBytes) {
+  if (!res.body) {
+    // doubles/older runtimes without a streaming body: buffer via arrayBuffer
+    const ab = await res.arrayBuffer();
+    if (ab.byteLength > maxBytes) throw new Error('response body exceeds ' + maxBytes + ' bytes');
+    return Buffer.from(ab);
+  }
+  const reader = res.body.getReader();
+  const chunks = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.length;
+    if (total > maxBytes) {
+      try { await reader.cancel(); } catch (_e) { /* ignore */ }
+      throw new Error('response body exceeds ' + maxBytes + ' bytes');
+    }
+    chunks.push(value);
+  }
+  return Buffer.concat(chunks);
+}
 
 /**
  * Hosts whose Set-Cookie we accept into the session jar. The download CDN and
  * OSS hosts are deliberately excluded — their cookies are not session
  * credentials and must never be replayed to the API hosts.
+ *
+ * The SAME allowlist gates egress: the session cookie is only ever sent to
+ * these hosts (fail-closed). Previously any host a caller passed received the
+ * cookie unless it remembered `noCookie` — one forgotten flag (or a future
+ * code path) would ship the session to a third party (audit finding H-1).
  */
 const COOKIE_HOSTS = new Set([
   'pan.quark.cn',
@@ -172,6 +239,7 @@ class HttpClient {
    *   timeoutMs?: number,
    *   fetchImpl?: typeof fetch,
    *   maxRedirects?: number,
+   *   maxBodyBytes?: number,      // cap for buffered (non-streaming) bodies
    *   logger?: {debug: Function, warn: Function},
    * }} [opts]
    */
@@ -181,6 +249,7 @@ class HttpClient {
     this.timeoutMs = opts.timeoutMs || DEFAULT_TIMEOUT_MS;
     this.fetchImpl = opts.fetchImpl || fetch;
     this.maxRedirects = opts.maxRedirects == null ? 10 : opts.maxRedirects;
+    this.maxBodyBytes = opts.maxBodyBytes == null ? MAX_BODY_BYTES : opts.maxBodyBytes;
     this.logger = opts.logger || { debug() {}, warn() {} };
   }
 
@@ -202,6 +271,7 @@ class HttpClient {
    */
   async request(method, rawUrl, opts = {}) {
     let url = new URL(rawUrl);
+    assertFetchableUrl(url, 'request URL');
     if (opts.query) {
       for (const [k, v] of Object.entries(opts.query)) {
         if (v === undefined || v === null) continue;
@@ -210,7 +280,7 @@ class HttpClient {
     }
 
     const firstHost = url.host;
-    /** cookies are only ever sent to the host we originally targeted */
+    /** cookies are only ever sent to COOKIE_HOSTS, and never across a redirect to another host */
     let maySendCookies = true;
     let redirects = 0;
 
@@ -221,7 +291,9 @@ class HttpClient {
         'Referer': 'https://pan.quark.cn/',
         'Origin': 'https://pan.quark.cn/',
       };
-      const cookieHeader = (opts.noCookie || !maySendCookies) ? '' : this.cookieJar.header();
+      const cookieHeader = (opts.noCookie || !maySendCookies || !COOKIE_HOSTS.has(url.hostname.toLowerCase()))
+        ? ''
+        : this.cookieJar.header();
       if (cookieHeader) headers.Cookie = cookieHeader;
       if (opts.body != null) headers['Content-Type'] = 'application/json';
       Object.assign(headers, opts.headers || {});
@@ -268,6 +340,8 @@ class HttpClient {
       if (isRedirect && redirects < this.maxRedirects) {
         redirects++;
         const next = new URL(location, url);
+        // every hop must pass the same SSRF guard as the initial URL
+        assertFetchableUrl(next, 'redirect target');
         if (next.host !== firstHost) maySendCookies = false; // never leak the session cross-host
         url = next;
         // GET/HEAD keep the body across redirects; other methods drop it.
@@ -276,7 +350,7 @@ class HttpClient {
       }
 
       if (opts.raw) return this._finish(response, url, opts, ac, timeoutMs);
-      const body = Buffer.from(await response.arrayBuffer());
+      const body = await readCappedBody(response, this.maxBodyBytes);
       return { status: response.status, headers: response.headers, url: url.toString(), body, response };
     }
   }

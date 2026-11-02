@@ -29,10 +29,19 @@ const { MountManager } = require('./mount/rclone.js');
 /** Console+file logger that redacts anything secret-looking. */
 function createLogger(logFile, { quiet = false, maxBytes = 5 * 1024 * 1024 } = {}) {
   const secrets = [];
+  /** providers are re-evaluated per log line (values that change over time) */
+  const secretProviders = [];
   function redact(s) {
     let out = String(s);
     for (const sec of secrets) {
       if (sec && sec.length >= 6) out = out.split(sec).join('<redacted>');
+    }
+    for (const prov of secretProviders) {
+      let vals;
+      try { vals = prov(); } catch (_e) { continue; }
+      for (const v of (Array.isArray(vals) ? vals : [vals])) {
+        if (v && v.length >= 6) out = out.split(v).join('<redacted>');
+      }
     }
     // log-injection guard: file names and URLs end up in log lines
     return out.replace(/[\r\n]+/g, ' ').replace(/[\x00-\x08\x0b\x0c\x0e-\x1f]/g, '');
@@ -56,6 +65,8 @@ function createLogger(logFile, { quiet = false, maxBytes = 5 * 1024 * 1024 } = {
   }
   return {
     addSecret(s) { if (s && !secrets.includes(s)) secrets.push(s); },
+    /** Register a (or array of) value(s) re-evaluated on every log line. */
+    addSecretProvider(fn) { if (typeof fn === 'function') secretProviders.push(fn); },
     debug: (...a) => write('DEBUG', a),
     info: (...a) => write('INFO', a),
     warn: (...a) => write('WARN', a),
@@ -79,10 +90,19 @@ function buildStack(opts = {}) {
   const session = config.loadSession();
   if (session) {
     http.cookieJar = CookieJar.fromJSON(session.cookies);
-    // Register the session cookie header as a secret so it can never leak into
-    // logs, even from a future log statement.
-    logger.addSecret(http.cookieJar.header());
   }
+  // Session cookies are re-evaluated on every log line: the full header AND
+  // each individual name=value pair are registered as secrets, so neither a
+  // rotated value (Set-Cookie during API calls, or a fresh login) nor a
+  // single pair can ever reach a log (audit finding C-4). A one-shot
+  // registration of the header at startup goes stale and misses both.
+  logger.addSecretProvider(() => {
+    const jar = http.cookieJar;
+    if (!jar) return [];
+    const vals = [jar.header()];
+    for (const v of jar.cookies.values()) vals.push(v);
+    return vals;
+  });
   const api = new QuarkApi({ http, device, logger });
   const uploader = new Uploader({ http, device, logger });
   const fsLayer = new QuarkFs({ api, uploader, http, logger });
@@ -95,6 +115,11 @@ function buildStack(opts = {}) {
     return out;
   };
   const settings = config.loadSettings();
+  // Give the rclone VFS on-disk cache a stable home under the app data dir
+  // unless the user pinned a custom location. ensureDirs() (above) created it,
+  // so the mount never has to race directory creation.
+  if (!settings.mountOptions) settings.mountOptions = {};
+  if (!settings.mountOptions.cacheDir) settings.mountOptions.cacheDir = config.paths.cacheDir;
   const mount = new MountManager({ settings, logger, rclonePath: opts.rclonePath });
   return { config, device, http, api, uploader, fs: fsLayer, auth, mount, logger, settings };
 }
@@ -252,6 +277,10 @@ async function cli(argv) {
       const w = await mount.checkWinFsp();
       console.log('winfsp     : ' + (w.ok ? 'OK' : 'MISSING — ' + w.reason));
       console.log('settings   : drive=' + settings.driveLetter + ' port=' + settings.webdavPort);
+      const mo = settings.mountOptions || {};
+      console.log('vfs cache  : max=' + (mo.vfsCacheMaxSize || '10G') +
+        ' mode=' + (mo.vfsCacheMode || 'writes') +
+        ' dir=' + (mo.cacheDir || '(rclone default)'));
       return 0;
     }
 

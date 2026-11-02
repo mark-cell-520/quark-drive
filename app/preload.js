@@ -19,6 +19,7 @@ const INVOKE_CHANNELS = [
   'settings:set',
   'app:openLogs',
   'app:openDrive',
+  'app:clearCache',
   'app:quit',
   'app:version',
 ];

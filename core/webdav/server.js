@@ -16,7 +16,7 @@ const crypto = require('node:crypto');
 const { multistatus, errorBody, parseRange, destinationPath, mimeTypeOf } = require('./xml.js');
 const { normalizePath, splitPath } = require('./quark-fs.js');
 
-const ALLOW_METHODS = 'OPTIONS, GET, HEAD, POST, PUT, DELETE, PROPFIND, PROPPATCH, MKCOL, MOVE, COPY';
+const ALLOW_METHODS = 'OPTIONS, GET, HEAD, PUT, DELETE, PROPFIND, PROPPATCH, MKCOL, MOVE';
 /** Chunked bodies (no Content-Length) are buffered in memory before upload. */
 const MAX_CHUNKED_BODY_BYTES = 256 * 1024 * 1024; // 256 MiB
 
@@ -67,18 +67,41 @@ function createWebDavServer(opts) {
 
   /** Requests must target us directly (blocks DNS-rebinding to the loopback). */
   function hostOk(req) {
-    const h = String(req.headers.host || '').toLowerCase();
+    const h = String(req.headers.host || '').trim().toLowerCase();
     if (!h) return false;
-    const hostpart = h.split(':')[0];
-    return hostpart === '127.0.0.1' || hostpart === 'localhost' || hostpart === '::1' || hostpart === '[::1]';
+    // userinfo trick: "127.0.0.1:80@evil.com" must not pass as loopback
+    // (audit finding W-1 — browsers never send this, but be strict anyway)
+    if (h.includes('@')) return false;
+    // strip the port; for a bracketed IPv6 literal the port follows the ']'
+    let hostpart = h;
+    const close = h.lastIndexOf(']');
+    if (close !== -1) {
+      hostpart = h.slice(0, close + 1); // [::1]:9798 -> [::1]
+    } else {
+      const colon = h.indexOf(':');
+      if (colon !== -1) hostpart = h.slice(0, colon);
+    }
+    const bare = hostpart.replace(/^\[/, '').replace(/]$/, '');
+    return bare === '127.0.0.1' || bare === 'localhost' || bare === '::1';
   }
 
   function sendDavHeaders(res, extra) {
-    res.setHeader('DAV', '1, 2');
+    // class 1 only: LOCK/UNLOCK are not implemented (advertising class 2
+    // would invite clients to call methods we 405 — audit finding W-4)
+    res.setHeader('DAV', '1');
     res.setHeader('MS-Author-Via', 'DAV');
     res.setHeader('Allow', ALLOW_METHODS);
     res.setHeader('Accept-Ranges', 'bytes');
     if (extra) for (const [k, v] of Object.entries(extra)) res.setHeader(k, v);
+  }
+
+  /** Constrain an upstream-supplied mime type to a token charset before it
+   *  reaches setHeader (a CRLF-laden value would throw there — W-6). */
+  function safeMime(mime) {
+    const m = String(mime || '').trim();
+    return /^[!#$%&'*+\-.^_`|~0-9a-z]+\/[!#$%&'*+\-.^_`|~0-9a-z]+$/i.test(m)
+      ? m
+      : 'application/octet-stream';
   }
 
   function sendError(res, status, message, condition) {
@@ -136,6 +159,31 @@ function createWebDavServer(opts) {
     }
 
     const range = parseRange(req.headers.range, st.size);
+
+    if (headOnly) {
+      // Answer HEAD from the stat alone: opening the stream would cost an
+      // API call + a CDN socket just to throw the body away (audit finding
+      // W-3). Headers match what a GET would return for a compliant CDN.
+      if (range) {
+        const length = range.end - range.start + 1;
+        sendDavHeaders(res, {
+          'Content-Type': mimeTypeOf(st.name),
+          'Content-Length': String(length),
+          'Content-Range': 'bytes ' + range.start + '-' + range.end + '/' + st.size,
+          'ETag': st.etag,
+          'Last-Modified': st.mtime.toUTCString(),
+        });
+        return res.writeHead(206).end();
+      }
+      sendDavHeaders(res, {
+        'Content-Type': mimeTypeOf(st.name),
+        'Content-Length': String(st.size),
+        'ETag': st.etag,
+        'Last-Modified': st.mtime.toUTCString(),
+      });
+      return res.writeHead(200).end();
+    }
+
     // Abort the upstream fetch when the client goes away (no socket leaks).
     const ac = new AbortController();
     res.on('close', () => { if (!res.writableEnded) ac.abort(new Error('client disconnected')); });
@@ -152,9 +200,13 @@ function createWebDavServer(opts) {
     const serveRange = !!(range && opened.partial);
     if (serveRange) {
       const length = opened.size;
-      const end = range.start + length - 1;
+      // Clamp to the real file size: a misbehaving 206 with an over-long
+      // body must not advertise a range end beyond the file (audit finding
+      // W-5). A compliant CDN returns exactly the requested bytes, so the
+      // clamp is a no-op there.
+      const end = Math.min(range.start + length - 1, st.size - 1);
       sendDavHeaders(res, {
-        'Content-Type': opened.mime,
+        'Content-Type': safeMime(opened.mime),
         'Content-Length': String(length),
         'Content-Range': 'bytes ' + range.start + '-' + end + '/' + st.size,
         'ETag': st.etag,
@@ -163,14 +215,13 @@ function createWebDavServer(opts) {
       res.writeHead(206);
     } else {
       sendDavHeaders(res, {
-        'Content-Type': opened.mime,
+        'Content-Type': safeMime(opened.mime),
         'Content-Length': String(opened.size),
         'ETag': st.etag,
         'Last-Modified': st.mtime.toUTCString(),
       });
       res.writeHead(200);
     }
-    if (headOnly) { res.end(); opened.stream.destroy(); return; }
     opened.stream.on('error', (e) => {
       logger.warn('stream error on ' + path + ': ' + e.message);
       res.destroy();

@@ -276,6 +276,7 @@
     $('chk-automount').checked = !!settings.autoMount;
     $('chk-autostart').checked = !!settings.startWithWindows;
     $('chk-startmin').checked = !!settings.startMinimized;
+    loadCacheSettings();
     const version = await api.invoke('app:version');
     $('version').textContent = 'v' + version;
   }
@@ -289,6 +290,82 @@
   $('chk-startmin').addEventListener('change', async (e) => {
     await api.invoke('settings:set', { startMinimized: e.target.checked });
   });
+
+  // ---------------------------------------------------------- cache settings
+
+  // presets offered in the size dropdown; "__custom" reveals a free-text field
+  const CACHE_SIZE_PRESETS = ['512M', '1G', '2G', '5G', '10G', '20G', '50G', 'off'];
+  const CACHE_MODES = ['off', 'minimal', 'writes', 'full'];
+
+  function applyCacheSizeToUI(value) {
+    const sel = $('sel-cache-size');
+    const v = String(value == null ? '' : value).trim();
+    if (CACHE_SIZE_PRESETS.includes(v)) {
+      sel.value = v;
+      $('cache-custom-row').classList.add('hidden');
+      $('inp-cache-size').value = '';
+    } else if (v) {
+      sel.value = '__custom';
+      $('inp-cache-size').value = v;
+      $('cache-custom-row').classList.remove('hidden');
+    } else {
+      sel.value = '10G';
+      $('cache-custom-row').classList.add('hidden');
+    }
+  }
+
+  function loadCacheSettings() {
+    const mo = (settings && settings.mountOptions) || {};
+    applyCacheSizeToUI(mo.vfsCacheMaxSize);
+    $('sel-cache-mode').value = CACHE_MODES.includes(mo.vfsCacheMode) ? mo.vfsCacheMode : 'writes';
+    $('cache-status').textContent = '';
+  }
+
+  function cacheChangedToast() {
+    if (drive && drive.mounted) toast('缓存设置已保存，重新挂载后生效');
+  }
+
+  async function saveCacheSize() {
+    const sel = $('sel-cache-size');
+    const value = sel.value === '__custom' ? $('inp-cache-size').value.trim() : sel.value;
+    if (!value) { toast('请输入缓存大小，例如 12G', true); return; }
+    try {
+      settings = await api.invoke('settings:set', { mountOptions: { vfsCacheMaxSize: value } });
+      applyCacheSizeToUI(settings.mountOptions.vfsCacheMaxSize);
+      cacheChangedToast();
+    } catch (e) {
+      toast('缓存大小无效，请使用如 10G / 500M / off', true);
+    }
+  }
+
+  $('sel-cache-size').addEventListener('change', async (e) => {
+    if (e.target.value === '__custom') {
+      $('cache-custom-row').classList.remove('hidden');
+      $('inp-cache-size').focus();
+      return; // save once the custom value is entered
+    }
+    $('cache-custom-row').classList.add('hidden');
+    await saveCacheSize();
+  });
+  $('inp-cache-size').addEventListener('change', () => saveCacheSize());
+  $('sel-cache-mode').addEventListener('change', async (e) => {
+    try {
+      settings = await api.invoke('settings:set', { mountOptions: { vfsCacheMode: e.target.value } });
+      cacheChangedToast();
+    } catch (err) {
+      toast('缓存模式设置失败', true);
+    }
+  });
+  $('btn-clear-cache').addEventListener('click', async () => {
+    const r = await api.invoke('app:clearCache');
+    if (r.cleared) {
+      $('cache-status').textContent = '已清理';
+      toast('缓存已清理');
+    } else {
+      toast(r.error || '清理失败', true);
+    }
+  });
+
   $('btn-logs').addEventListener('click', () => api.invoke('app:openLogs'));
 
   $('btn-quit').addEventListener('click', async () => {

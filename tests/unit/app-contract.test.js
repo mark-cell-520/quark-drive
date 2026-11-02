@@ -107,6 +107,23 @@ test('main.js hardens the BrowserWindow (no nodeIntegration, isolation on, sandb
   assert.doesNotMatch(htmlSrc, /<script[^>]+src="https?:/);
 });
 
+test('E-1: the renderer HTML carries a strict Content-Security-Policy', () => {
+  const m = /<meta http-equiv="Content-Security-Policy"\s+content="([^"]+)"/.exec(htmlSrc);
+  assert.ok(m, 'index.html must declare a CSP meta tag');
+  const csp = m[1];
+  assert.match(csp, /default-src 'none'/, 'default-src must deny everything by default');
+  assert.match(csp, /script-src 'self'/);
+  assert.match(csp, /style-src 'self'/);
+  assert.match(csp, /img-src 'self' data:/, 'the QR code is rendered from a data: URL');
+  assert.match(csp, /connect-src 'none'/, 'the renderer must not be able to make network requests');
+  assert.doesNotMatch(csp, /unsafe-inline/, 'no unsafe-inline');
+  assert.doesNotMatch(csp, /unsafe-eval/, 'no unsafe-eval');
+  // nothing the CSP would block may be loaded by the page
+  assert.doesNotMatch(htmlSrc, /<link[^>]+href="https?:/);
+  assert.doesNotMatch(htmlSrc, /<img[^>]+src="https?:/);
+  assert.doesNotMatch(htmlSrc, /url\(['"]?https?:/);
+});
+
 test('N-2: mount/unmount/server operations are serialized in main.js', () => {
   // concurrent tray clicks must not spawn two rclone processes
   assert.match(mainSrc, /require\('\.\/op-queue\.js'\)/, 'main must use the op queue');
@@ -133,12 +150,16 @@ test('N-3: the login loop carries an abort signal into every HTTP call', () => {
   assert.match(mainSrc, /async function cancelLogin\(/);
 });
 
-test('N-1: the rclone RC daemon requires per-run credentials', () => {
+test('N-1/M-3: the rclone RC daemon requires per-run credentials passed via env (not argv)', () => {
   assert.doesNotMatch(rcloneSrc, /--rc-no-auth/, 'the RC API must never be unauthenticated');
-  assert.match(rcloneSrc, /--rc-user/);
-  assert.match(rcloneSrc, /--rc-pass/);
-  assert.match(rcloneSrc, /Authorization.*Basic|Basic.*Authorization/, 'RC calls must authenticate');
+  // credentials must NOT appear in argv — same-user processes can read the
+  // process table (Win32_Process.CommandLine) and would recover them
+  assert.doesNotMatch(rcloneSrc, /'--rc-user'/, 'rc-user must not be an argv flag');
+  assert.doesNotMatch(rcloneSrc, /'--rc-pass'/, 'rc-pass must not be an argv flag');
+  assert.match(rcloneSrc, /RCLONE_RC_USER/, 'RC user must come from the child environment');
+  assert.match(rcloneSrc, /RCLONE_RC_PASS/, 'RC pass must come from the child environment');
   assert.match(rcloneSrc, /randomCreds/, 'credentials must be generated per run');
+  assert.match(rcloneSrc, /Authorization.*Basic|Basic.*Authorization/, 'RC calls must authenticate');
 });
 
 test('feature: transfer progress polling and start-minimized are wired', () => {
@@ -155,5 +176,33 @@ test('feature: transfer progress polling and start-minimized are wired', () => {
   const invoke = listLiteral(preloadSrc, 'INVOKE_CHANNELS');
   for (const c of ['app:openDrive', 'app:quit']) {
     assert.ok(invoke.has(c), c + ' must be whitelisted');
+  }
+});
+
+test('round-3: the window never navigates/opens popups; the log line drops the URL token', () => {
+  assert.match(mainSrc, /will-navigate/, 'renderer-initiated navigation must be blocked');
+  assert.match(mainSrc, /setWindowOpenHandler\(\s*\(\)\s*=>\s*\(\{\s*action:\s*'deny'\s*\}\)/, 'popups must be denied');
+  // M-3: the per-run URL prefix is a secret — it must never reach the log file
+  assert.doesNotMatch(mainSrc, /port \+ srv\.urlPrefix/, 'the URL token must not be logged');
+  assert.match(mainSrc, /webdav listening on 127\.0\.0\.1:' \+ port\)/);
+  // settings:set must not let an explicit undefined erase a stored key
+  assert.match(mainSrc, /if \(v === undefined\) continue/, 'explicit undefined must not drop a settings key');
+});
+
+test('feature: cache size/mode are renderer-settable and sanitized', () => {
+  // the renderer must not be able to smuggle arbitrary rclone options through
+  // mountOptions — main.js routes them through the strict sanitizer
+  assert.match(mainSrc, /sanitizeRendererMountOptions/, 'main must sanitize mountOptions patches');
+  assert.match(mainSrc, /clean\.mountOptions/, 'main must merge only the cleaned cache keys');
+  // cache clearing is guarded to the app data dir and refuses while mounted
+  assert.match(mainSrc, /app:clearCache/, 'main must handle cache clearing');
+  assert.match(mainSrc, /isInside\(stack\.config\.baseDir, dir\)/, 'clearCache must be path-guarded');
+  assert.match(mainSrc, /if \(stack\.mount\.isMounted\)[\s\S]*?请先卸载/, 'clearCache must refuse while mounted');
+  const invoke = listLiteral(preloadSrc, 'INVOKE_CHANNELS');
+  assert.ok(invoke.has('app:clearCache'), 'app:clearCache must be whitelisted');
+  // the renderer wires every cache control to an element that exists in the HTML
+  for (const id of ['sel-cache-size', 'inp-cache-size', 'sel-cache-mode', 'btn-clear-cache', 'cache-status', 'cache-custom-row']) {
+    assert.ok(rendererSrc.includes("'" + id + "'"), 'renderer must reference #' + id);
+    assert.ok(htmlSrc.includes('id="' + id + '"'), 'html must define #' + id);
   }
 });

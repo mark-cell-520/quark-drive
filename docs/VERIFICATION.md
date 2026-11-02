@@ -6,18 +6,19 @@
 
 | 验证 | 命令 | 结果 |
 |---|---|---|
-| 单元 + 集成 + 稳定性测试 | `npm test` | **195/195 通过** |
+| 单元 + 集成 + 稳定性测试 | `npm test` | **219/219 通过** |
 | 性能基准 | `node scripts/bench.js` | 见 docs/PERFORMANCE.md |
 | 打包内容校验 | `node scripts/verify-package.js` | **19/19 必需文件；无测试/vendor/机密泄漏** |
-| 一键安装器构建 | `npx electron-builder --win nsis` | **QuarkDrive Setup 0.1.0.exe（143.8 MB）+ blockmap** |
+| vendor 完整性门禁 | `node scripts/verify-vendor.js` | **2/2 artifacts sha256 校验通过（beforePack + predist 双接入）** |
+| 一键安装器构建 | `npx electron-builder --win nsis` | **QuarkDrive Setup 0.1.0.exe + blockmap**（第三轮构建需 `ELECTRON_MIRROR=https://npmmirror.com/mirrors/electron/`） |
 | 生产依赖漏洞 | `npm audit --omit=dev` | **0 vulnerabilities** |
 
 ### 测试构成
 
-- **单元**：device / http（cookie、重定向、鉴权、raw body 看门狗）/ auth（扫码四步全流程、abort 透传）/ api（列表、下载任务轮询、23018 回退、增删改移）/ sha1ctx（RFC 2202 向量 + crypto 交叉 + 状态导出）/ upload（OSS 全流程、秒传、409 恢复、Hash-Ctx、并发分片、线性摄入）/ xml（转义、Range、Destination、快速日期与原生逐字节一致）/ quark-fs（缓存、并发、覆盖语义、URL 缓存）/ rclone（RC 生命周期、注入防护、Basic auth、竞态锁、transfers）/ config / index（CLI、脱敏、轮转）/ op-queue（串行化、重入不死锁）/ app-contract（IPC 通道、DOM ID、加固断言、新功能接线）
-- **集成**：mock Quark 后端 + 真实 HTTP 的完整 WebDAV 协议套件（含原始 socket 穿越测试）
+- **单元**：device / http（cookie、重定向、鉴权、raw body 看门狗、SSRF 守卫、body 上限）/ auth（扫码四步全流程、abort 透传）/ api（列表、下载任务轮询、23018 回退、增删改移）/ sha1ctx（RFC 2202 向量 + crypto 交叉 + 状态导出）/ upload（OSS 全流程、秒传、409 恢复、Hash-Ctx、并发分片、线性摄入）/ xml（转义、Range、Destination、快速日期与原生逐字节一致）/ quark-fs（缓存、并发、覆盖语义、URL 缓存）/ rclone（RC 生命周期、注入防护、env 凭证、Basic auth、竞态锁、transfers）/ config / index（CLI、脱敏、轮转、动态秘密 provider）/ op-queue（串行化、重入不死锁、在途提交排队）/ app-contract（IPC 通道、DOM ID、加固断言、CSP、窗口锁定、新功能接线）
+- **集成**：mock Quark 后端 + 真实 HTTP 的完整 WebDAV 协议套件（含原始 socket 穿越测试、Host 头矩阵、HEAD 元数据应答、恶意 mime 回落）
 - **稳定性**（`tests/stability/soak.test.js`）：100 并发 PROPFIND 风暴（响应体逐一比对）、混合并发 GET/PUT/PROPFIND/MKCOL/MOVE/DELETE 后命名空间一致性、下载中途断连 abort 上游且服务存活、10 类畸形请求（无 Host/异主机/未知方法/坏令牌/坏编码/坏 Range/异主机 Destination/穿越/双重编码）、单连接 keep-alive 50 连续请求、100 路写入后锁表归零、失败上传不死锁后续写
-- **审计回归**：`tests/unit/audit-regressions.test.js` + `tests/unit/audit-findings.test.js`（两轮共 18+16+9 项发现的回归）
+- **审计回归**：`tests/unit/audit-regressions.test.js` + `tests/unit/audit-findings.test.js`（三轮共 18+16+9+19 项发现的回归）
 
 ## 真机验证（本机，第一轮 2026-11-02）
 
@@ -75,9 +76,29 @@ member（无会话）→ 403 → AuthError（鉴权检测正确）
 
 ```bash
 npm install && npm run vendor
-npm test                    # 应 195/195
+npm test                    # 应 219/219
+npm run verify-vendor       # 应 2/2 artifacts OK
 npm run smoke:mount Q       # 应 SMOKE TEST PASSED（需本沙箱限制外的环境）
 npm start                   # 扫码登录 → 自动挂载 → 资源管理器浏览 Q:
-npm run dist                # 生成安装器；双击安装（观察 WinFsp 提示与快捷方式）
+npm run dist                # 生成安装器（predist 先过 vendor 门禁）；双击安装（观察 WinFsp 提示与快捷方式）
 node scripts/bench.js       # 性能基线
 ```
+
+## 第三轮验证（2026-11-02，本沙箱）
+
+```
+node --test                       → 219/219 通过
+npm audit --omit=dev              → 0 vulnerabilities
+node scripts/verify-vendor.js     → vendor integrity OK (2 artifacts)
+node scripts/verify-package.js    → 19/19 必需文件，无泄漏
+真实 rclone v1.75.2 实证           → RCLONE_RC_USER/RCLONE_RC_PASS env 生效；
+                                    无凭证 401 / Basic auth 200
+npx electron-builder --win nsis   → 构建成功（beforePack vendor 门禁生效；
+                                    asar 抽查：CSP / AsyncLocalStorage op-queue /
+                                    SSRF 守卫 / 脱敏 provider / env 凭证均已入包）
+node scripts/bench.js --quick     → 全量基准无回退
+```
+
+**第三轮环境限制**：旧 `dist/win-unpacked/QuarkDrive.exe` 被不可见进程锁定
+（`rmdir`/改名均 EBUSY，疑杀软扫描），构建输出至 `dist3/`；Electron GUI 与
+真实 rclone 挂载冒烟受沙箱限制未能执行（同前两轮说明）。

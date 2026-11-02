@@ -8,6 +8,8 @@
   "scripts": {
     "start": "electron .",
     "dist": "electron-builder --win nsis",
+    "predist": "node scripts/verify-vendor.js",
+    "verify-vendor": "node scripts/verify-vendor.js",
     "test": "node --test",
     "vendor": "node scripts/fetch-vendor.mjs",
     "icon": "node scripts/make-icon.js",
@@ -25,12 +27,12 @@
     "productName": "QuarkDrive",
     "copyright": "MIT",
     "compression": "maximum",
+    "beforePack": "scripts/verify-vendor.js",
     "files": [
       "app/**/*",
       "core/**/*",
       "!core/**/*.test.js",
-      "!tests/**/*",
-      "scripts/make-icon.js"
+      "!tests/**/*"
     ],
     "extraResources": [
       {

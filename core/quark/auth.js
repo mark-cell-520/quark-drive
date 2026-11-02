@@ -13,6 +13,7 @@
  * token value.
  */
 const { AuthError } = require('./http.js');
+const crypto = require('node:crypto');
 
 const UOP_BASE = 'https://uop.quark.cn/cas/ajax';
 const SCAN_PAGE = 'https://su.quark.cn/4_eMHBJ';
@@ -30,8 +31,14 @@ const ST_EXPIRED = 50004002;
 
 const QR_TTL_MS = 3 * 60 * 1000; // codes rotate; the official client uses ~3 min
 
+/**
+ * Correlation nonce for the cas handshake. Uses the crypto PRNG, not the
+ * non-cryptographic one: it is not a session secret, but every other value in
+ * this codebase that a server could conceivably bind to replay/CSRF
+ * protection is CSPRNG-sourced (audit finding C-3).
+ */
 function uniqueRequestId() {
-  const rnd = String(Math.floor(Math.random() * 1e6)).padStart(6, '0');
+  const rnd = String(crypto.randomInt(0, 1000000)).padStart(6, '0');
   return String(Date.now()) + rnd;
 }
 

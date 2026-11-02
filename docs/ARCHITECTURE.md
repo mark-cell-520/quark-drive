@@ -73,6 +73,12 @@ MountManager.mount()   （在途锁：并发调用合并为一次尝试，绝不
 RC 端点是**每运行随机凭证保护**的：无凭证请求（含浏览器 CORS simple request）
 一律 401——否则同机任意进程可借受害者身份枚举文件系统或卸载盘符。
 
+**缓存设置**：`VfsCacheMaxSize`（磁盘缓存上限，默认 10G）与 `VfsCacheMode`（writes/full/minimal/off）
+开放给用户在设置页手动调整；渲染层传入的值经 `sanitizeRendererMountOptions` 白名单校验后才进入
+rclone 命令行（未知键丢弃、非法值报错，`rclonePath` 等危险键渲染层永远碰不到）。VFS 磁盘缓存固定落在
+`%LOCALAPPDATA%\QuarkDrive\vfs-cache`（构建栈时自动创建），可随时在设置页「清理缓存」
+（需先卸载，带 `isInside` 路径防护，绝不误删 rclone 正在写的文件）。改缓存大小/模式后重新挂载生效。
+
 ### 登录（扫码）
 
 ```
@@ -86,7 +92,8 @@ auth.complete GET pan.quark.cn/desktop/account/login?st=<ticket> → Set-Cookie�
 
 - **渲染层不可信**：`contextIsolation: true` + `sandbox: true` + `nodeIntegration: false`；preload 仅暴露白名单 IPC 通道；渲染层拿不到 Cookie/令牌。
 - **WebDAV 服务**：仅绑 `127.0.0.1`；每次运行随机 URL 令牌；校验 `Host`；rclone remote 携带令牌。
-- **Cookie 流向**：只发给夸克 API 主机；跨主机重定向自动停止发送；下载/上传到 CDN/OSS 时 `noCookie`；CDN/OSS 设的 Cookie 不入会话罐。
+- **Cookie 流向**：只发给夸克 API 主机（`COOKIE_HOSTS` 出站白名单，fail-closed——不依赖调用方传 `noCookie`）；跨主机重定向自动停止发送；下载/上传到 CDN/OSS 时 `noCookie`；CDN/OSS 设的 Cookie 不入会话罐。
+- **出站目标**：初始 URL 与每个重定向跳转都必须是 https 公网域名（拒绝 IP 字面量/内网域名/明文/userinfo）——服务端下发的 `download_url`/`upload_url`/`Location` 无法把客户端变成指向回环或内网的 SSRF 探针；非流式响应体 64 MiB 封顶。
 - **名称与路径**：所有写入名称过 `assertValidName`；路径按名精确查找（`..`/编码/反斜杠均无法穿越命名空间）。
 - **进程边界**：rclone 以数组参数 spawn（无 shell），盘符经 `normalizeLetter` 校验；`rclonePath` 仅环境变量/CLI 可设（渲染层不可设，防 RCE 放大）。
 - **日志**：Cookie 头与 QR 令牌注册为秘密自动脱敏；换行/控制字符摊平（防日志注入）；5MB 轮转。

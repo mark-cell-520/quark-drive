@@ -175,15 +175,19 @@ test('mount succeeds through the RC API (rcd + mount/mount + listmounts)', async
 
   const spawnCalls = [];
   const m = makeManager({
-    spawn: (cmd, args) => {
-      spawnCalls.push({ cmd, args });
+    spawn: (cmd, args, opts) => {
+      spawnCalls.push({ cmd, args, opts });
       assert.equal(args[0], 'rcd', 'rclone must be started as the RC daemon');
       assert.ok(args.includes('--rc-addr'));
       assert.ok(args.some((a) => a === '127.0.0.1:' + rcPort), 'rc-addr must use the chosen port');
       // N-1: per-run RC credentials, and NO --rc-no-auth
       assert.ok(!args.includes('--rc-no-auth'), 'the RC API must require auth');
-      assert.ok(args.includes('--rc-user'), 'rc-user must be set');
-      assert.ok(args.includes('--rc-pass'), 'rc-pass must be set');
+      // M-3: credentials must NOT travel in argv (readable by same-user
+      // processes via the process table) — they go through the child env
+      assert.ok(!args.includes('--rc-user'), 'rc-user must not be in argv');
+      assert.ok(!args.includes('--rc-pass'), 'rc-pass must not be in argv');
+      assert.ok(opts && opts.env && /^qd[0-9a-f]+$/.test(opts.env.RCLONE_RC_USER), 'RCLONE_RC_USER must be set in the child env');
+      assert.ok(opts.env.RCLONE_RC_PASS && opts.env.RCLONE_RC_PASS.length >= 16, 'RCLONE_RC_PASS must be set in the child env');
       return fakeChild;
     },
     sleep: async () => {},
@@ -200,6 +204,45 @@ test('mount succeeds through the RC API (rcd + mount/mount + listmounts)', async
     for (const a of seenAuth) {
       assert.match(a, /^Basic [A-Za-z0-9+/=]+$/, 'RC requests must authenticate');
     }
+  } finally {
+    rcServer.close();
+  }
+});
+
+test('custom cache size/mode/cacheDir are forwarded to rclone', async () => {
+  const http = require('node:http');
+  const { EventEmitter } = require('node:events');
+  let mountBody = null;
+  let spawnArgs = null;
+  const rcServer = http.createServer((req, res) => {
+    let body = '';
+    req.on('data', (c) => { body += c; });
+    req.on('end', () => {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      if (req.url === '/core/version') res.end(JSON.stringify({ version: 'v' }));
+      else if (req.url === '/mount/mount') { mountBody = JSON.parse(body); res.end(JSON.stringify({ mountPoint: 'Y:\\' })); }
+      else if (req.url === '/mount/listmounts') res.end(JSON.stringify({ mountPoints: [{ mountPoint: 'Y:\\' }] }));
+      else res.end('{}');
+    });
+  });
+  const rcPort = await new Promise((r) => rcServer.listen(0, '127.0.0.1', () => r(rcServer.address().port)));
+  const fakeChild = new EventEmitter();
+  fakeChild.exitCode = null;
+  fakeChild.pid = 9;
+  fakeChild.stderr = new EventEmitter();
+  fakeChild.kill = () => {};
+  const m = makeManager({
+    settings: { driveLetter: 'Y', mountOptions: { vfsCacheMaxSize: '25G', vfsCacheMode: 'full', cacheDir: 'C:\\cache\\qd' } },
+    spawn: (cmd, args) => { spawnArgs = args; return fakeChild; },
+    sleep: async () => {},
+    freePort: async () => rcPort,
+  });
+  try {
+    await m.mount({ port: 1234, letter: 'Y', urlPrefix: '/' + 'a'.repeat(48) });
+    assert.equal(mountBody.vfsOpt.VfsCacheMaxSize, '25G', 'user cache size reaches rclone');
+    assert.equal(mountBody.vfsOpt.VfsCacheMode, 'full', 'user cache mode reaches rclone');
+    assert.ok(spawnArgs.includes('--cache-dir'), 'cacheDir must be forwarded as --cache-dir');
+    assert.ok(spawnArgs.includes('C:\\cache\\qd'), 'the cache dir value must be passed through');
   } finally {
     rcServer.close();
   }

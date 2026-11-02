@@ -223,3 +223,23 @@ test('same-host redirects keep sending cookies', async () => {
   await http.request('GET', 'https://pan.quark.cn/start');
   assert.deepEqual(seen, ['a=1', 'a=1']);
 });
+
+test('H-1: the session cookie is NEVER sent to a non-Quark host (fail-closed allowlist)', async () => {
+  const seen = [];
+  const fakeFetch = async (url, init) => {
+    seen.push({ url, cookie: init.headers.Cookie || null });
+    return res(200, { headers: { 'content-type': 'application/json' }, body: '{}' });
+  };
+  const http = new HttpClient({
+    fetchImpl: fakeFetch,
+    cookieJar: new CookieJar({ __puus: 'secret-session', __pus: 'x' }),
+  });
+  // even without noCookie — a caller that forgets the flag must not leak
+  await http.requestJson('GET', 'https://evil.example.com/collect');
+  assert.equal(seen[0].cookie, null, 'no cookie to a foreign host, no matter what the caller passes');
+  // ...but Quark API hosts still get it
+  await http.requestJson('GET', 'https://drive-pc.quark.cn/1/clouddrive/member');
+  assert.equal(seen[1].cookie, '__puus=secret-session; __pus=x');
+  await http.requestJson('GET', 'https://uop.quark.cn/cas/ajax/getTokenForQrcodeLogin');
+  assert.equal(seen[2].cookie, '__puus=secret-session; __pus=x');
+});

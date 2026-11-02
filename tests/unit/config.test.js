@@ -8,7 +8,8 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 
-const { ConfigStore, DEFAULT_SETTINGS, isInside, deepMerge, defaultBaseDir } = require('../../core/config.js');
+const { ConfigStore, DEFAULT_SETTINGS, isInside, deepMerge, defaultBaseDir,
+  normalizeRcloneSize, validateCacheMode, sanitizeRendererMountOptions } = require('../../core/config.js');
 
 function tmpStore() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'quarkdrive-cfg-'));
@@ -89,4 +90,60 @@ test('deepMerge is recursive and non-destructive', () => {
 test('defaultBaseDir points at LOCALAPPDATA/QuarkDrive', () => {
   const dir = defaultBaseDir();
   assert.match(dir, /QuarkDrive$/);
+});
+
+test('config store exposes a cache dir under baseDir', () => {
+  const store = tmpStore();
+  assert.equal(store.paths.cacheDir, path.join(store.baseDir, 'vfs-cache'));
+  store.ensureDirs();
+  assert.ok(fs.existsSync(store.paths.cacheDir), 'ensureDirs creates the cache dir');
+});
+
+// --------------------------------------------------------- mount option guards
+
+test('normalizeRcloneSize canonicalises valid sizes', () => {
+  assert.equal(normalizeRcloneSize('10G'), '10G');   // the documented default
+  assert.equal(normalizeRcloneSize('10g'), '10G');
+  assert.equal(normalizeRcloneSize('500M'), '500M');
+  assert.equal(normalizeRcloneSize('10 GiB'), '10G'); // space + iB tolerated
+  assert.equal(normalizeRcloneSize('1.5G'), '1.5G');
+  assert.equal(normalizeRcloneSize('off'), 'off');
+  assert.equal(normalizeRcloneSize('OFF'), 'off');
+  assert.equal(normalizeRcloneSize('2048'), '2048');  // bare bytes
+  assert.equal(normalizeRcloneSize('2T'), '2T');
+});
+
+test('normalizeRcloneSize rejects garbage and out-of-range values', () => {
+  assert.equal(normalizeRcloneSize(''), null);        // unset
+  assert.equal(normalizeRcloneSize('0'), null);       // must be positive
+  assert.equal(normalizeRcloneSize('abc'), null);
+  assert.equal(normalizeRcloneSize('10X'), null);
+  assert.equal(normalizeRcloneSize('-5G'), null);
+  assert.equal(normalizeRcloneSize('1.5'), null);     // non-integer bare bytes
+  assert.equal(normalizeRcloneSize('999999999P'), null); // over the 1 PiB cap
+});
+
+test('validateCacheMode accepts only rclone cache modes', () => {
+  for (const m of ['off', 'minimal', 'writes', 'full']) assert.equal(validateCacheMode(m), m);
+  assert.equal(validateCacheMode('WRITES'), 'writes');
+  assert.equal(validateCacheMode('turbo'), null);
+  assert.equal(validateCacheMode(''), null);
+});
+
+test('sanitizeRendererMountOptions keeps cache keys and validates them', () => {
+  const ok = sanitizeRendererMountOptions({ vfsCacheMaxSize: '8g', vfsCacheMode: 'full' });
+  assert.equal(ok.ok, true);
+  assert.deepEqual(ok.cleaned, { vfsCacheMaxSize: '8G', vfsCacheMode: 'full' });
+});
+
+test('sanitizeRendererMountOptions drops unknown keys, rejects bad values', () => {
+  // rclonePath / bufferSize must never reach rclone from the renderer
+  const r = sanitizeRendererMountOptions({ vfsCacheMaxSize: '5G', rclonePath: '/evil', bufferSize: '1G' });
+  assert.equal(r.ok, true);
+  assert.deepEqual(r.cleaned, { vfsCacheMaxSize: '5G' });
+  const bad = sanitizeRendererMountOptions({ vfsCacheMaxSize: 'huge' });
+  assert.equal(bad.ok, false);
+  assert.match(bad.error, /vfsCacheMaxSize/);
+  const badMode = sanitizeRendererMountOptions({ vfsCacheMode: 'nope' });
+  assert.equal(badMode.ok, false);
 });

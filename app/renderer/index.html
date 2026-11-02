@@ -3,6 +3,12 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <!-- Defence in depth (audit finding E-1): the renderer needs nothing but
+       its own script/style files and data: QR images. Blocking everything
+       else means even a hypothetical renderer compromise cannot load or
+       exfiltrate to remote origins. -->
+  <meta http-equiv="Content-Security-Policy"
+        content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'none'; base-uri 'none'; form-action 'none'">
   <title>QuarkDrive</title>
   <link rel="stylesheet" href="styles.css">
 </head>
@@ -79,6 +85,42 @@
         <input type="checkbox" id="chk-startmin">
         <span>启动时最小化到托盘（不显示主窗口）</span>
       </label>
+
+      <div class="cache-block">
+        <div class="row">
+          <label for="sel-cache-size">缓存大小</label>
+          <select id="sel-cache-size">
+            <option value="512M">512 MB</option>
+            <option value="1G">1 GB</option>
+            <option value="2G">2 GB</option>
+            <option value="5G">5 GB</option>
+            <option value="10G">10 GB（默认）</option>
+            <option value="20G">20 GB</option>
+            <option value="50G">50 GB</option>
+            <option value="off">不限</option>
+            <option value="__custom">自定义…</option>
+          </select>
+        </div>
+        <div class="row hidden" id="cache-custom-row">
+          <label for="inp-cache-size">自定义</label>
+          <input id="inp-cache-size" type="text" placeholder="如 12G / 500M / off" spellcheck="false">
+        </div>
+        <div class="row">
+          <label for="sel-cache-mode">缓存模式</label>
+          <select id="sel-cache-mode">
+            <option value="writes">写入缓存（推荐）</option>
+            <option value="full">完整缓存（读取更流畅，更占空间）</option>
+            <option value="minimal">最小缓存</option>
+            <option value="off">关闭</option>
+          </select>
+        </div>
+        <div class="row">
+          <button id="btn-clear-cache" class="btn secondary small" type="button">清理缓存</button>
+          <span id="cache-status" class="cache-status"></span>
+        </div>
+        <p class="hint">磁盘缓存让浏览与读取更流畅；修改大小/模式后重新挂载生效。缓存位于本机 %LOCALAPPDATA%\QuarkDrive\vfs-cache。</p>
+      </div>
+
       <div class="row">
         <button id="btn-logs" class="btn secondary small" type="button">打开日志目录</button>
         <button id="btn-quit" class="btn danger small" type="button">退出应用</button>
